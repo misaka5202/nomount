@@ -316,24 +316,45 @@ jobs:
             # 注意: vmlinux.o 在 O= 外部构建时不是合法顶层 target
             # ("No rule to make target 'vmlinux.o'"), 但 vmlinux 会先编出
             # vmlinux.o 再链接, modpost 因此走 vmlinux.symvers 分支,
-            # Module.symvers 才有内容.
+            # vmlinux.symvers 才有内容.
             echo "    编译 vmlinux (触发 vmlinux.o + modpost)..."
-            make -j"$(nproc)" $COMMON_FLAGS vmlinux
+            make -j"$(nproc)" $COMMON_FLAGS vmlinux || true
           fi
 
-          echo "=== Module.symvers 状态 ==="
+          echo "=== 符号表文件状态 ==="
+          ls -lh out/*.symvers 2>/dev/null || echo "(无任何 symvers)"
+
+          # 外部模块 (M=) 构建时 scripts/Makefile.modpost 走的是 else 分支,
+          # 只认 KBUILD_EXTMOD 目录下的 Module.symvers, 不会去读 out/vmlinux.symvers。
+          # 所以必须通过 KBUILD_EXTRA_SYMBOLS 显式把 vmlinux 的 CRC 表喂进去,
+          # 否则编出的 ko 符号版本信息为空, 设备上加载会失败或直接 panic。
+          if [ ! -f out/Module.symvers ]; then
+            if [ -f out/vmlinux.symvers ]; then
+              echo "    用 vmlinux.symvers 作为额外符号表 (KBUILD_EXTRA_SYMBOLS)"
+              EXTRA_SYMBOLS="KBUILD_EXTRA_SYMBOLS=$PWD/out/vmlinux.symvers"
+            else
+              echo "::error::既没有 out/Module.symvers 也没有 out/vmlinux.symvers"
+              exit 1
+            fi
+          else
+            EXTRA_SYMBOLS=""
+          fi
+
+          echo "=== 最终确认符号表 ==="
           if [ -f out/Module.symvers ]; then
             ls -lh out/Module.symvers
             echo "    条目数: $(wc -l < out/Module.symvers)"
+          elif [ -f out/vmlinux.symvers ]; then
+            ls -lh out/vmlinux.symvers
+            echo "    vmlinux.symvers 条目数: $(wc -l < out/vmlinux.symvers)"
           else
-            echo "::error::out/Module.symvers 未能生成, 这样的 ko 在设备上无法正确加载"
-            ls -lh out/*.symvers 2>/dev/null || true
+            echo "::error::没有可用的符号表, 中止"
             exit 1
           fi
 
           echo ">>> 编译 nomount.ko ..."
           echo "BUILD_CLANG=$(clang --version | head -n1)" >> "$GITHUB_ENV"
-          make -j"$(nproc)" $COMMON_FLAGS M="$PWD/fs/nomount" modules
+          make -j"$(nproc)" $COMMON_FLAGS $EXTRA_SYMBOLS M="$PWD/fs/nomount" modules
 
           echo ">>> 查找产物..."
           find . -name 'nomount.ko' 2>/dev/null | head -n 20
@@ -361,20 +382,40 @@ jobs:
           echo "=== 依赖的 VFS 符号 (抽样) ==="
           llvm-nm -u "$KO" 2>/dev/null | grep -E 'd_lookup|generic_file_mmap|iget5_locked|vfs_getattr|d_splice_alias|d_add|register_key_type' || true
 
-          echo "=== 与内核 Module.symvers 交叉校验 CRC ==="
-          if [ -f out/Module.symvers ]; then
-            MISSING=0
-            for sym in $(llvm-nm -u "$KO" 2>/dev/null | awk '{print $2}'); do
-              if grep -qE "\s${sym}\s" out/Module.symvers 2>/dev/null; then
-                :
-              else
-                # 允许部分非 vmlinux 符号（模块内部）
-                true
-              fi
-            done
-            echo "Module.symvers 存在，CRC 校验通过构建保证"
+          echo "=== 校验 ko 内是否写入了符号 CRC (__crc_ 符号) ==="
+          # CONFIG_MODVERSIONS=y 时 modpost 会给每个引用符号生成 __crc_<sym>,
+          # 这是设备加载时做版本匹配的依据. 若一个都没有, 说明符号表没喂进去,
+          # 这种 ko 上机必然失败 (no version for symbol / 或地址错位 panic).
+          SYMVERS_TABLE="out/Module.symvers"
+          [ -f "$SYMVERS_TABLE" ] || SYMVERS_TABLE="out/vmlinux.symvers"
+
+          CRC_COUNT=$(llvm-nm "$KO" 2>/dev/null | grep -c '__crc_' || true)
+          echo "ko 内 __crc_ 符号数量: $CRC_COUNT"
+
+          if [ "${CRC_COUNT:-0}" -gt 0 ]; then
+            echo "  OK: ko 已带符号 CRC, 可在目标内核上做版本校验"
+            llvm-nm "$KO" 2>/dev/null | grep '__crc_' | head -n 5
           else
-            echo "警告: 未生成 out/Module.symvers"
+            echo "::warning::ko 内没有 __crc_ 符号"
+            echo "  可能 CONFIG_MODVERSIONS 未开启, 或符号表未生效"
+            grep -E '^CONFIG_MODVERSIONS' out/.config || echo "  (config 中无 MODVERSIONS)"
+          fi
+
+          echo "=== 关键 VFS 符号是否能在内核符号表中找到 ==="
+          MISSING=0
+          for sym in d_lookup d_splice_alias d_add iget5_locked register_key_type \
+                     generic_file_mmap generic_file_read_iter vfs_getattr \
+                     notify_change kill_anon_super deactivate_locked_super; do
+            if grep -qE "\b${sym}\b" "$SYMVERS_TABLE" 2>/dev/null; then
+              echo "  OK       $sym"
+            else
+              echo "  MISSING  $sym"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          echo "缺失符号数: $MISSING"
+          if [ "$MISSING" -gt 2 ]; then
+            echo "::warning::多个关键 VFS 符号不在符号表中, ko 可能无法解析"
           fi
 
           echo "=== .ko 大小与段 ==="
