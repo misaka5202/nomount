@@ -322,71 +322,32 @@ jobs:
             CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
-          # 用设备内核的完整 config 作为精确基线。
+          # 用设备内核的完整 config 作为基线, 但必须"先树后设备"两步走。
           #
-          # 之前的做法是拿 gki_defconfig 或 vendor defconfig 片段去 merge，但：
-          #   - gki_defconfig 只有 666 项，设备实际生效 3094 项
-          #   - 缺掉的那 2428 项里有 CONFIG_SYSFS / CONFIG_FTRACE /
-          #     CONFIG_STACKTRACE_BUILD_ID 这类会改变 struct module 字段组成的开关
-          #   - 于是我们的 __this_module 与内核的 struct module 布局不同，
-          #     mod_sysfs_setup() 按自己的偏移访问即越界 —— 这正是那次 panic：
-          #       pc: mod_sysfs_setup+0x218/0x2ec
-          #       x1 指向的内存里能看到 "nomount" 字符串
+          # 背景: 设备 config 有 3094 项，而 gki_defconfig 只有 666 项。
+          # 缺掉的那些里有 CONFIG_SYSFS / CONFIG_FTRACE / CONFIG_STACKTRACE_BUILD_ID
+          # 这类会改变 struct module 字段组成的开关。布局不同 ->
+          # mod_sysfs_setup() 按自己的偏移访问越界 -> 刷入即 panic：
+          #   pc: mod_sysfs_setup+0x218/0x2ec   x1 处可见 "nomount"
           #
-          # 已验证 gki_defconfig 是设备 config 的纯子集且零值冲突，因此直接以
-          # 设备 config 为基线是安全的，不需要任何 merge 猜测。
-          # 直接用设备 config 作为 out/.config，但需要双向补齐。
-          #
-          # 观测到的事实:
-          #   1) make xxx_defconfig / olddefconfig 会把设备 config 里那些
-          #      vendor 专属符号(about 2400 项)当作未知项, 连带重置依赖它们的
-          #      通用项 -> CONFIG_MODULES / MODVERSIONS / MODULE_UNLOAD 全掉,
+          # 观测到的两种失败:
+          #   1) make xxx_defconfig: 把 2400 个 vendor 专属符号当未知项,
+          #      连锁重置 CONFIG_MODULES/MODVERSIONS/MODULE_UNLOAD,
           #      vmlinux 直接拒绝编译("modules disabled")。
-          #   2) 单纯 syncconfig 也不行: 树里有设备 config 未记录的新符号,
-          #      Kconfig 以 "(NEW)" 交互提问, 非交互环境下按默认值处理,
-          #      同样把整体状态改坏。
+          #   2) 纯 syncconfig: 树里有设备未记录的新符号, Kconfig 以 "(NEW)"
+          #      提问, 非交互下取默认值, 同样重置关键项。
           #
-          # 所以先让树自己生成一份自洽的 .config (olddefconfig 基于 gki_defconfig),
-          # 再把设备 config 的值逐项覆盖回去。这样既有树认可的完整符号集,
-          # 又有设备的真实取值。
+          # 可行解: 先让树基于 gki_defconfig 生成自洽 .config, 再把设备
+          # 显式声明的每一项强制覆盖上去。
           make -j"$(nproc)" $FLAGS gki_defconfig
           cp -f out/.config out/.config.tree
 
           # 用设备 config 覆盖: 设备里出现的每一项都强制写入(含 =n),
           # 保证 struct module 等结构的条件开关与设备一致。
-          python3 - out/.config.tree "$GITHUB_WORKSPACE/device_full.config" out/.config <<'PY'
-import sys
-tree, dev, outp = sys.argv[1], sys.argv[2], sys.argv[3]
-dev_lines = [l.rstrip('\n') for l in open(dev, encoding='utf-8', errors='replace')]
-dev_map = {}
-for l in dev_lines:
-    if l.startswith('CONFIG_') and '=' in l:
-        k, v = l.split('=', 1)
-        dev_map[k] = l
-    elif l.startswith('# CONFIG_') and l.endswith(' is not set'):
-        k = l[2:].split(' is not set')[0].strip()
-        dev_map[k] = l
-
-out, seen = [], set()
-for l in open(tree, encoding='utf-8', errors='replace'):
-    l = l.rstrip('\n')
-    if l.startswith('CONFIG_') and '=' in l:
-        k = l.split('=', 1)[0]
-        out.append(dev_map.get(k, l))
-        seen.add(k)
-    elif l.startswith('# CONFIG_') and l.endswith(' is not set'):
-        k = l[2:].split(' is not set')[0].strip()
-        out.append(dev_map.get(k, l))
-        seen.add(k)
-    else:
-        out.append(l)
-
-# 树里没有、但设备有的符号: 追加(未知符号会被 syncconfig 忽略, 无害)
-extra = [v for k, v in dev_map.items() if k not in seen]
-out.extend(extra)
-open(outp, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
-print(f'[overlay] tree lines overlaid; device-only symbols appended: {len(extra)}')
-PY
+          # 逻辑放在 scripts/overlay_config.py, 避免把 Python 内联进 YAML
+          # (缩进一旦错位整个 workflow 会解析失败)。
+          python3 "$GITHUB_WORKSPACE/scripts/overlay_config.py" \
+            out/.config.tree "$GITHUB_WORKSPACE/device_full.config" out/.config
 
           # 设备 config 里 CONFIG_MODULE_SIG_KEY 指向打包时才知道的路径，
           # 且 CONFIG_MODULE_SIG_ALL 未开启（模块不签名），对齐为不指定密钥。

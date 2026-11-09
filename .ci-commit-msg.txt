@@ -1,23 +1,22 @@
-ci: overlay device config onto a tree-generated .config
+fix(ci): move config overlay to scripts/, repair broken workflow YAML
 
-Neither of the two previous approaches can work on their own:
+The previous commit inlined a Python heredoc into the workflow's run
+block. Its lines started at column 1, which is outside the YAML block
+scalar, so the whole workflow failed to parse:
 
- - `make xxx_defconfig` / olddefconfig reconciles every symbol against the
-   tree's Kconfig. The device config carries ~2400 vendor-only options that
-   common/ has no Kconfig entry for; the reconciliation cascades and takes
-   MODULES / MODVERSIONS / MODULE_UNLOAD down with it, so vmlinux refuses
-   to build ("The present kernel configuration has modules disabled").
+    yaml.scanner.ScannerError: while scanning a simple key
+    .github/workflows/release-oppo-module.yml, line 358
 
- - Dropping the device config in verbatim and running syncconfig hits the
-   opposite problem: the tree has symbols the device config never recorded,
-   Kconfig asks about each one as "(NEW)", and with no stdin it applies
-   defaults, which again resets the same critical options.
+GitHub then reported "Workflow does not have 'workflow_dispatch'
+trigger" because the file no longer parsed at all. Move the overlay
+logic into scripts/overlay_config.py and call it from the run block.
 
-Generate a self-consistent .config from gki_defconfig first, then overlay
-every value the device config specifies (including "is not set" entries)
-on top of it. The result is the tree's complete symbol universe carrying
-the device's actual values, which is what struct layouts depend on.
+Also regenerate device_full.config properly. The earlier copy was
+captured through PowerShell's default UTF-16 encoding, which doubled its
+size to 540106 bytes and injected U+FFFD replacement characters, so
+every CONFIG_ line failed to match and the overlay silently parsed 0
+device symbols. The file is now 260934 bytes of pure ASCII, and the
+overlay reports 7395 device symbols.
 
-Verified locally that the overlay keeps MODULES, MODVERSIONS,
-MODULE_UNLOAD and KALLSYMS_ALL enabled. Gates before and after syncconfig
-now fail fast if any of them gets reset again.
+Verified locally: MODULES, MODVERSIONS, MODULE_UNLOAD, FTRACE,
+KALLSYMS_ALL, SYSFS, ARM64 and CFI_CLANG all keep the device's values.
