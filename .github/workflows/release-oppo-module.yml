@@ -412,6 +412,26 @@ jobs:
           [ -f fs/nomount/nomount.ko ] || { echo "::error::未生成 nomount.ko"; exit 1; }
           ls -lh fs/nomount/nomount.ko
 
+      - name: 用设备真实 CRC 修正 module_layout
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+          KO=fs/nomount/nomount.ko
+
+          # 开源树是 6.1.134，出货内核是 6.1.157。中间的 stable 回移改过
+          # struct module，于是 genksyms 算出的 module_layout CRC 与设备不同。
+          # 6.1 的 check_modstruct_version()（kernel/module/main.c）在 CRC
+          # 不匹配时直接 return -ENOEXEC，且不打印任何日志 —— 用户态只能看到
+          # "Exec format error"，无法从 dmesg 定位。这正是本项目的核心障碍。
+          #
+          # 设备上 /vendor{,_dlkm}/lib/modules/*.ko 每个模块都带 __versions 段，
+          # 其中记录着它们导入符号在"运行内核"上的真实 CRC。逐符号覆盖之。
+          python3 "$GITHUB_WORKSPACE/scripts/patch_crc.py" \
+            "$KO" "$GITHUB_WORKSPACE/device_symvers.txt" "$KO.patched"
+          mv -f "$KO.patched" "$KO"
+          chmod 644 "$KO"
+          ls -lh "$KO"
+
       - name: 校验 ko
         id: verify
         run: |
@@ -447,6 +467,18 @@ jobs:
           done
           echo "  缺失关键符号: $MISSING"
           [ "$MISSING" -eq 0 ] || { echo "::error::关键 VFS 符号缺失"; exit 1; }
+
+          echo "=== 校验 module_layout CRC 已对齐设备 ==="
+          DEV_ML=$(awk -F'\t' '$2=="module_layout"{print $1; exit}' "$GITHUB_WORKSPACE/device_symvers.txt")
+          KO_ML=$(python3 "$GITHUB_WORKSPACE/scripts/get_crc.py" "$KO" module_layout)
+          echo "  设备 module_layout: ${DEV_ML:-<none>}"
+          echo "  ko   module_layout: $KO_ML"
+          [ -n "$DEV_ML" ] || { echo "::error::device_symvers.txt 里没有 module_layout"; exit 1; }
+          if [ "$DEV_ML" != "$KO_ML" ]; then
+            echo "::error::module_layout CRC 未对齐设备, 上机会静默 ENOEXEC"
+            exit 1
+          fi
+          echo "  OK: module_layout CRC 与设备内核一致"
 
           echo "KO_VERMAGIC=$VERMAGIC" >> "$GITHUB_ENV"
 

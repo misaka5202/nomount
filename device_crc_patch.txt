@@ -1,0 +1,2 @@
+0xea759d7f	module_layout	vmlinux	EXPORT_SYMBOL
+0x4185838a	generic_file_read_iter	vmlinux	EXPORT_SYMBOL
