@@ -359,15 +359,18 @@ jobs:
 
           # BTF 相关：不参与 genksyms CRC，关闭不影响 ABI。
           # NOMOUNT 必须在此写入；fs/nomount/Kconfig 已在前一步挂载。
+          # MITIGATION_ITS 由 scripts/patch_module_layout.py 补了 Kconfig 条目，
+          # 这里显式打开，使 module.h 里的 #ifdef 成立（设备内核同样启用）。
           ./scripts/config --file out/.config \
             -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -d DEBUG_INFO -d PAHOLE \
-            -m NOMOUNT
+            -m NOMOUNT -e MITIGATION_ITS
 
           echo "=== 配置与设备一致性核对 ==="
           MISS=0
           for k in CONFIG_MODULES CONFIG_SYSFS CONFIG_FTRACE CONFIG_MODULE_UNLOAD \
                    CONFIG_KALLSYMS_ALL CONFIG_CFI_CLANG CONFIG_TRACEPOINTS \
-                   CONFIG_JUMP_LABEL CONFIG_MODVERSIONS CONFIG_ARM64; do
+                   CONFIG_JUMP_LABEL CONFIG_MODVERSIONS CONFIG_ARM64 \
+                   CONFIG_MITIGATION_ITS; do
             if grep -q "^${k}=y" out/.config; then
               echo "  OK    $k=y"
             else

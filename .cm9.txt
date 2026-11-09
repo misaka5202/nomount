@@ -1,0 +1,26 @@
+﻿feat: reproduce the device's struct module exactly, ifdef included
+
+Previous attempt emitted only the two fields:
+
+    int its_num_pages;
+    void **its_page_array;
+
+module_layout did move (0xa26bedb1 -> 0xed15e86a), which proved those
+fields are the difference, but it still missed the device's 0xea759d7f.
+genksyms hashes the preprocessed token stream, so omitting the enclosing
+#ifdef/#endif changes the hash even when the members are identical.
+
+Reproduce the construct verbatim:
+
+    #ifdef CONFIG_MITIGATION_ITS
+            int its_num_pages;
+            void **its_page_array;
+    #endif
+
+and register CONFIG_MITIGATION_ITS in arch/arm64/Kconfig, because this
+6.1.134 tree predates the option and syncconfig would otherwise drop any
+value written into .config, leaving the ifdef false.
+
+Verified locally: after patching, struct module matches the device's
+kheaders line for line (139 lines, zero differences after comment
+stripping).
