@@ -210,15 +210,19 @@ jobs:
       - name: 缓存内核符号表
         id: symvers
         uses: actions/cache@v5
+        # 暂时不再缓存 vmlinux.symvers。
+        #
+        # 这张表的每一行都由 genksyms 依据当时的头文件/配置算出，而缓存 key
+        # 无法覆盖"源码内容"的变化：module.h 被 patch、CONFIG 开关被改写，
+        # key 不变就会命中旧表，modpost 于是把旧 CRC 写进 ko，
+        # 实验结果永远是上一次的。已经因此浪费了数轮（CRC 停在 0xa26bedb1、
+        # 再停在 0xed15e86a 而没被察觉）。
+        #
+        # 正确性优先于速度：等 module_layout 与设备一致后再考虑重建缓存。
+        if: false
         with:
           path: kernel_workspace/common/out/vmlinux.symvers
-          # 版本号必须随"会改变 struct 布局的输入"一起 bump，否则会命中
-          # 旧符号表，导致 module_layout CRC 永远停在旧值 —— 之前几轮
-          # 无论怎么改配置/头文件，CRC 都固执地停在 0xa26bedb1 就是这个原因:
-          # 日志里 "符号表已存在: 15286 条" 就是缓存命中，vmlinux 没有重编。
-          #   v3: 设备完整 config
-          #   v4: + struct module 补 MITIGATION_ITS 字段
-          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v4-its
+          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-disabled
 
       - name: 清理 ABI 文件并对齐设备内核版本
         run: |
@@ -439,9 +443,15 @@ jobs:
           # 这里把符号表的 md5 打出来，便于确认它确实随改动更新。
           if [ -s out/vmlinux.symvers ]; then
             echo ">>> 符号表已存在: $(wc -l < out/vmlinux.symvers) 条, md5=$(md5sum out/vmlinux.symvers | cut -d' ' -f1)"
-            echo ">>> 校验 module_layout 是否为本次布局生成"
-            if grep -P '\tmodule_layout\t' out/vmlinux.symvers | grep -q '0xa26bedb1'; then
-              echo "::warning::符号表里的 module_layout 仍是旧值 0xa26bedb1，将强制重编 vmlinux"
+            SYM_ML=$(grep -P '\tmodule_layout\t' out/vmlinux.symvers | cut -f1 | head -n1)
+            DEV_ML_TARGET=$(awk -F'\t' '$2=="module_layout"{print $1; exit}' "$GITHUB_WORKSPACE/device_symvers.txt")
+            echo "    符号表 module_layout: ${SYM_ML:-<none>}"
+            echo "    设备   module_layout: ${DEV_ML_TARGET:-<none>}"
+            # 唯一可靠的判据: 符号表里的 module_layout 必须与设备一致。
+            # 之前只比对某个具体旧值(0xa26bedb1)，换成 0xed15e86a 后就没触发重编，
+            # 导致改动根本没被验证。这里改为与设备值比对。
+            if [ "$SYM_ML" != "$DEV_ML_TARGET" ]; then
+              echo "::warning::符号表 module_layout ($SYM_ML) != 设备 ($DEV_ML_TARGET)，丢弃并重编 vmlinux"
               rm -f out/vmlinux.symvers out/Module.symvers
             fi
           fi
