@@ -229,15 +229,23 @@ jobs:
 
           # 官方树自带的 resolve_btfids/libbpf 在 Clang20 下必然编译失败，
           # 且 nomount 不需要 BTF，直接关掉。
+          # NOMOUNT 必须在这里（olddefconfig 之前）写入，这样 include/config/auto.conf
+          # 才会带上它。如果在 modules_prepare 之后才改 .config，auto.conf 是旧的，
+          # obj-$(CONFIG_NOMOUNT) 展开为空，make 会认为无事可做，直接跳过编译。
           ./scripts/config --file out/.config -d DEBUG_INFO_BTF      || true
           ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES || true
           ./scripts/config --file out/.config -d DEBUG_INFO          || true
           ./scripts/config --file out/.config -d PAHOLE              || true
-          make -j"$(nproc)" $FLAGS olddefconfig
+          ./scripts/config --file out/.config -m NOMOUNT             || true
 
+          make -j"$(nproc)" $FLAGS olddefconfig
           make -j"$(nproc)" $FLAGS modules_prepare
 
-          ./scripts/config --file out/.config -m NOMOUNT
+          echo "=== 确认 auto.conf 里 NOMOUNT 已生效 ==="
+          grep '^CONFIG_NOMOUNT' out/include/config/auto.conf || {
+            echo "::error::auto.conf 里没有 CONFIG_NOMOUNT"
+            exit 1
+          }
 
           KREL="$(cat out/include/config/kernel.release 2>/dev/null || make -s O=out ARCH=arm64 LLVM=1 kernelrelease)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
@@ -302,7 +310,8 @@ jobs:
           cp -f out/vmlinux.symvers Module.symvers
 
           export KBUILD_EXTRA_SYMBOLS="$PWD/out/vmlinux.symvers"
-          make -j"$(nproc)" $FLAGS M="$PWD/fs/nomount" modules
+          # 命令行变量双保险: 即使 auto.conf 异常, obj-m 也会被填上
+          make -j"$(nproc)" $FLAGS CONFIG_NOMOUNT=m M="$PWD/fs/nomount" modules
 
           [ -f fs/nomount/nomount.ko ] || { echo "::error::未生成 nomount.ko"; exit 1; }
           ls -lh fs/nomount/nomount.ko
