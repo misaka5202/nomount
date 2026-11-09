@@ -212,8 +212,13 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel_workspace/common/out/vmlinux.symvers
-          # v3: 改用设备完整 config 作基线, struct 布局与所有 CRC 都会变, 必须重算
-          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-devcfg-v3
+          # 版本号必须随"会改变 struct 布局的输入"一起 bump，否则会命中
+          # 旧符号表，导致 module_layout CRC 永远停在旧值 —— 之前几轮
+          # 无论怎么改配置/头文件，CRC 都固执地停在 0xa26bedb1 就是这个原因:
+          # 日志里 "符号表已存在: 15286 条" 就是缓存命中，vmlinux 没有重编。
+          #   v3: 设备完整 config
+          #   v4: + struct module 补 MITIGATION_ITS 字段
+          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v4-its
 
       - name: 清理 ABI 文件并对齐设备内核版本
         run: |
@@ -424,15 +429,32 @@ jobs:
           # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
           # 不会去读 out/vmlinux.symvers。没有这张 CRC 表，ko 的 __versions
           # 段就是空的，设备上加载会失败或解析到错位函数指针而 panic。
+          #
+          # 注意 out/vmlinux.symvers 必须与"这次的 struct 布局"对应。
+          # 之前几轮改了 module.h 却仍从缓存拿到同一份 symvers，于是
+          # module_layout 一直停在 0xa26bedb1，实验等于没做。
+          # 这里把符号表的 md5 打出来，便于确认它确实随改动更新。
           if [ -s out/vmlinux.symvers ]; then
-            echo ">>> 符号表已存在: $(wc -l < out/vmlinux.symvers) 条"
-          else
-            echo ">>> 编译 vmlinux 以生成符号表 (约 15-20 分钟)..."
+            echo ">>> 符号表已存在: $(wc -l < out/vmlinux.symvers) 条, md5=$(md5sum out/vmlinux.symvers | cut -d' ' -f1)"
+            echo ">>> 校验 module_layout 是否为本次布局生成"
+            if grep -P '\tmodule_layout\t' out/vmlinux.symvers | grep -q '0xa26bedb1'; then
+              echo "::warning::符号表里的 module_layout 仍是旧值 0xa26bedb1，将强制重编 vmlinux"
+              rm -f out/vmlinux.symvers out/Module.symvers
+            fi
+          fi
+
+          if [ ! -s out/vmlinux.symvers ]; then
+            echo ">>> 编译 vmlinux 以生成符号表 (约 20-30 分钟)..."
+            # module.h 被改过，但只要 mtime 比对象文件旧，kbuild 就不会重编。
+            # 这里先 touch 一下，确保依赖它的源文件全部重建，
+            # 否则 module_layout 仍会沿用旧的对象文件内容。
+            touch include/linux/module.h
             make -j"$(nproc)" $FLAGS vmlinux || true
           fi
 
           [ -s out/vmlinux.symvers ] || { echo "::error::符号表缺失"; exit 1; }
           echo ">>> 符号表: $(wc -l < out/vmlinux.symvers) 条"
+          echo ">>> module_layout: $(grep -P '\tmodule_layout\t' out/vmlinux.symvers | cut -f1)"
 
           cp -f out/vmlinux.symvers fs/nomount/Module.symvers
           cp -f out/vmlinux.symvers Module.symvers
