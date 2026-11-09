@@ -335,17 +335,58 @@ jobs:
           #
           # 已验证 gki_defconfig 是设备 config 的纯子集且零值冲突，因此直接以
           # 设备 config 为基线是安全的，不需要任何 merge 猜测。
-          # 直接用设备 config 作为 out/.config，不走 make <name>_defconfig。
+          # 直接用设备 config 作为 out/.config，但需要双向补齐。
           #
-          # 原因: make xxx_defconfig 内部会跑一遍 Kconfig 解析，设备 config 里
-          # 那 2428 个 vendor 专属符号在 common/ 树里没有定义，Kconfig 会把它们
-          # 连同被牵连的通用项一起重置 —— 实测 CONFIG_MODULES / MODVERSIONS /
-          # MODULE_UNLOAD / KALLSYMS_ALL / FTRACE 全被关掉，连模块都编不出来。
+          # 观测到的事实:
+          #   1) make xxx_defconfig / olddefconfig 会把设备 config 里那些
+          #      vendor 专属符号(about 2400 项)当作未知项, 连带重置依赖它们的
+          #      通用项 -> CONFIG_MODULES / MODVERSIONS / MODULE_UNLOAD 全掉,
+          #      vmlinux 直接拒绝编译("modules disabled")。
+          #   2) 单纯 syncconfig 也不行: 树里有设备 config 未记录的新符号,
+          #      Kconfig 以 "(NEW)" 交互提问, 非交互环境下按默认值处理,
+          #      同样把整体状态改坏。
           #
-          # 直接把设备 config 放成 out/.config，再用 scripts/config 打补丁，
-          # 最后由 syncconfig 只做 include/config/auto.conf 的生成，不做裁决策。
-          mkdir -p out
-          cp -f "$GITHUB_WORKSPACE/device_full.config" out/.config
+          # 所以先让树自己生成一份自洽的 .config (olddefconfig 基于 gki_defconfig),
+          # 再把设备 config 的值逐项覆盖回去。这样既有树认可的完整符号集,
+          # 又有设备的真实取值。
+          make -j"$(nproc)" $FLAGS gki_defconfig
+          cp -f out/.config out/.config.tree
+
+          # 用设备 config 覆盖: 设备里出现的每一项都强制写入(含 =n),
+          # 保证 struct module 等结构的条件开关与设备一致。
+          python3 - out/.config.tree "$GITHUB_WORKSPACE/device_full.config" out/.config <<'PY'
+import sys
+tree, dev, outp = sys.argv[1], sys.argv[2], sys.argv[3]
+dev_lines = [l.rstrip('\n') for l in open(dev, encoding='utf-8', errors='replace')]
+dev_map = {}
+for l in dev_lines:
+    if l.startswith('CONFIG_') and '=' in l:
+        k, v = l.split('=', 1)
+        dev_map[k] = l
+    elif l.startswith('# CONFIG_') and l.endswith(' is not set'):
+        k = l[2:].split(' is not set')[0].strip()
+        dev_map[k] = l
+
+out, seen = [], set()
+for l in open(tree, encoding='utf-8', errors='replace'):
+    l = l.rstrip('\n')
+    if l.startswith('CONFIG_') and '=' in l:
+        k = l.split('=', 1)[0]
+        out.append(dev_map.get(k, l))
+        seen.add(k)
+    elif l.startswith('# CONFIG_') and l.endswith(' is not set'):
+        k = l[2:].split(' is not set')[0].strip()
+        out.append(dev_map.get(k, l))
+        seen.add(k)
+    else:
+        out.append(l)
+
+# 树里没有、但设备有的符号: 追加(未知符号会被 syncconfig 忽略, 无害)
+extra = [v for k, v in dev_map.items() if k not in seen]
+out.extend(extra)
+open(outp, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+print(f'[overlay] tree lines overlaid; device-only symbols appended: {len(extra)}')
+PY
 
           # 设备 config 里 CONFIG_MODULE_SIG_KEY 指向打包时才知道的路径，
           # 且 CONFIG_MODULE_SIG_ALL 未开启（模块不签名），对齐为不指定密钥。
@@ -356,10 +397,6 @@ jobs:
           ./scripts/config --file out/.config \
             -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -d DEBUG_INFO -d PAHOLE \
             -m NOMOUNT
-
-          # syncconfig 生成 auto.conf（会做一次依赖检查，但不改 .config 里
-          # 已显式设置的值）
-          make -j"$(nproc)" $FLAGS syncconfig
 
           echo "=== 配置与设备一致性核对 ==="
           MISS=0
@@ -381,6 +418,15 @@ jobs:
             grep -E '^#? ?CONFIG_(MODULES|MODVERSIONS|MODULE_UNLOAD|ARM64)\b' out/.config || true
             exit 1
           }
+
+          make -j"$(nproc)" $FLAGS syncconfig
+
+          # syncconfig 后再次确认(它可能仍会改动个别项)
+          echo "=== syncconfig 后复核 ==="
+          for k in CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD; do
+            grep -q "^${k}=y" out/.config && echo "  OK    $k=y" || {
+              echo "::error::syncconfig 后 $k 被重置"; exit 1; }
+          done
 
           make -j"$(nproc)" $FLAGS modules_prepare
 

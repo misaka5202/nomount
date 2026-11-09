@@ -1,19 +1,23 @@
-ci: load the device config verbatim instead of via *_defconfig target
+ci: overlay device config onto a tree-generated .config
 
-`make device_defconfig` reconciles the whole configuration against the
-tree's Kconfig before writing out/.config. The device config carries
-about 2400 vendor-only symbols that common/ has no Kconfig entry for,
-and the reconciliation cascades: MODULES, MODVERSIONS, MODULE_UNLOAD,
-KALLSYMS_ALL and FTRACE all came back disabled, so vmlinux refused to
-build at all with
+Neither of the two previous approaches can work on their own:
 
-    *** The present kernel configuration has modules disabled.
+ - `make xxx_defconfig` / olddefconfig reconciles every symbol against the
+   tree's Kconfig. The device config carries ~2400 vendor-only options that
+   common/ has no Kconfig entry for; the reconciliation cascades and takes
+   MODULES / MODVERSIONS / MODULE_UNLOAD down with it, so vmlinux refuses
+   to build ("The present kernel configuration has modules disabled").
 
-Place the device config directly as out/.config and run syncconfig
-instead, which generates include/config/auto.conf without re-deriving
-every symbol.
+ - Dropping the device config in verbatim and running syncconfig hits the
+   opposite problem: the tree has symbols the device config never recorded,
+   Kconfig asks about each one as "(NEW)", and with no stdin it applies
+   defaults, which again resets the same critical options.
 
-Add an explicit gate on the options that must stay enabled (MODULES,
-MODVERSIONS, MODULE_UNLOAD, ARM64) and dump the offending lines on
-failure, so a silently reverted config cannot reach the compile step
-again.
+Generate a self-consistent .config from gki_defconfig first, then overlay
+every value the device config specifies (including "is not set" entries)
+on top of it. The result is the tree's complete symbol universe carrying
+the device's actual values, which is what struct layouts depend on.
+
+Verified locally that the overlay keeps MODULES, MODVERSIONS,
+MODULE_UNLOAD and KALLSYMS_ALL enabled. Gates before and after syncconfig
+now fail fast if any of them gets reset again.
