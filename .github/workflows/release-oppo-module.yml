@@ -43,6 +43,11 @@ on:
         required: true
         type: boolean
         default: true
+      vermagic_suffix:
+        description: 'vermagic 后缀,必须与设备上已刷内核的 setlocalversion 后缀一致(留空则用内核树原生生成的版本号)'
+        required: false
+        type: string
+        default: 'android14-11-o-gca13bffobf09'
 
 permissions:
   contents: write
@@ -199,7 +204,7 @@ jobs:
           path: kernel_workspace/common/out/vmlinux.symvers
           key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v1
 
-      - name: 清理 ABI 文件并修正 vermagic 后缀
+      - name: 清理 ABI 文件并对齐 vermagic 后缀
         run: |
           set -euo pipefail
           cd kernel_workspace
@@ -211,6 +216,25 @@ jobs:
             # 而 vermagic 带 "+" 会让设备 insmod 报 version magic mismatch 直接拒绝。
             sed -i 's|res="$res${scm:++}"|res="$res"|' "$f"
           done
+
+          # 与设备内核的 vermagic 对齐: 设备上刷入的内核通常由厂商内核构建流程
+          # (如 cctv18 的 fastbuild) 把 setlocalversion 的输出整体替换为固定后缀,
+          # 见 scripts/setlocalversion 最后一行 echo。这里应用同样的替换,
+          # 否则 ko 的 vermagic(内核树原生 hash)与设备内核(固定后缀)不一致,
+          # insmod 会报 "version magic ... should be ..." 拒绝加载。
+          #
+          # 另注: 内核树经 zip 下载没有 .git, 但 setlocalversion 的 git rev-parse
+          # 会向上层目录找到 CI checkout 的 .git, 把无关的 commit hash 泄进版本号;
+          # 固定后缀替换同时规避了这个问题。
+          if [ -n "${{ inputs.vermagic_suffix }}" ]; then
+            for f in common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ inputs.vermagic_suffix }}\"|" "$f"
+            done
+            echo ">>> vermagic 后缀已固定为: -${{ inputs.vermagic_suffix }}"
+            tail -n 3 common/scripts/setlocalversion
+          else
+            echo ">>> 未指定 vermagic_suffix, 使用内核树原生版本号(含 CI hash, 仅供本地测试)"
+          fi
 
       - name: 生成 .config 并 modules_prepare
         run: |
@@ -403,13 +427,40 @@ jobs:
           [ -n "$KO_SRC" ] || { echo "::error::artifact 里没有 nomount.ko"; ls -R ./ko; exit 1; }
           echo "ko: $KO_SRC ($(stat -c%s "$KO_SRC") bytes)"
 
+          # 模块基底使用上游官方 release zip: 仓库里的 module/ 目录不含 bin/，
+          # 而 bin/nm-* 和 bin/lkmloader-* 是上游 CI 用 zig 交叉编译后注入的。
+          # 缺了它们，customize.sh 会在架构检查处 abort —— 报错文案误写成
+          # "Unsupported architecture"，实际是二进制缺失。
+          echo ">>> 下载上游官方 release 作为模块基底..."
+          mkdir -p upstream_rel
+          for i in 1 2 3 4 5; do
+            if gh release download -R maxsteeel/nomount \
+                 --pattern 'NoMount-*.zip' --dir upstream_rel --clobber; then
+              break
+            fi
+            echo "::warning::上游 release 下载失败 (第 $i/5 次)"
+            sleep $((i * 4))
+          done
+          UPSTREAM_ZIP="$(find upstream_rel -name 'NoMount-*.zip' | head -n1)"
+          [ -n "$UPSTREAM_ZIP" ] || { echo "::error::拿不到上游 release zip"; exit 1; }
+          echo "上游包: $UPSTREAM_ZIP"
+
           mkdir -p build
-          cp -a module build/nomount
+          rm -rf build/nomount
+          mkdir -p build/nomount
+          unzip -q "$UPSTREAM_ZIP" -d build/nomount
+
+          echo "=== 上游包内容 (确认 bin/ 存在) ==="
+          ls build/nomount
+          ls build/nomount/bin/ 2>/dev/null || echo "  警告: 上游包也没有 bin/"
+          ls build/nomount/lkm/ 2>/dev/null
+
           cd build/nomount
 
-          # 清掉官方预置的通用 LKM（如果有）
-          rm -rf lkm
-          mkdir -p lkm
+          # 移除上游全部通用 LKM: 它们的 vermagic/CRC 是 GKI DDK 的，
+          # 留着任何一个都可能被 customize.sh 的 glob 兜底逻辑选中加载，
+          # 在厂商内核上必然 panic。
+          rm -f lkm/nomount-*.ko
 
           # Ko 命名必须符合 customize.sh 的查找规则:
           #   EXACT = lkm/nomount-${AKVER}-${KVER}${ARCH_SFX}.ko
@@ -496,8 +547,19 @@ jobs:
           | 模块源码 | `${{ inputs.modules_repo }}` |
           | 模块分支 | `${{ inputs.modules_branch }}` |
           | 内核版本 | `${{ needs.build-ko.outputs.kernelrelease }}` |
+          | vermagic 后缀 | `${{ inputs.vermagic_suffix }}`（须与设备上已刷内核一致） |
           | 工具链 | Clang 20 (Android r547379) |
           | nomount | `${{ github.sha }}` |
+
+          #### vermagic 对齐说明
+
+          ko 的 vermagic 必须与设备上**正在运行**的内核完全一致，否则
+          `insmod` 直接报 `version magic ... should be ...` 拒绝加载。
+
+          本包构建时按 `${{ inputs.vermagic_suffix }}` 固定了版本后缀，
+          与常见厂商内核构建流程（如 fastbuild 系列脚本）产出的内核一致。
+          若你的设备内核是其他后缀（或 OTA 后变化），请在触发本 workflow
+          时填写对应的 `vermagic_suffix` 重新构建。
 
           #### 质量校验（构建时强制）
 
