@@ -244,9 +244,11 @@ jobs:
 
           cd kernel_workspace/common
 
-          # nomount 的 Makefile 依赖 srctree 相对路径，直接软链进 fs/ 更省事
+          # 复制而不是软链: kbuild 的 M= 对符号链接目录处理不可靠,
+          # 会导致 MODPOST 跑完却没有生成 .ko
           rm -rf fs/nomount
-          ln -sfn "$NM_SRC" fs/nomount
+          mkdir -p fs/nomount
+          cp -f "$NM_SRC"/*.c "$NM_SRC"/*.h "$NM_SRC"/Makefile "$NM_SRC"/Kconfig fs/nomount/
 
           # 挂 Kconfig
           if ! grep -q 'fs/nomount/Kconfig' fs/Kconfig; then
@@ -269,6 +271,7 @@ jobs:
             echo "  fs/Makefile 已挂载"
           fi
 
+          echo "=== fs/nomount 内容 ==="
           ls -la fs/nomount
           tail -n 3 fs/Makefile
 
@@ -298,19 +301,38 @@ jobs:
 
           cd kernel_workspace/common
 
-          echo ">>> 编译 nomount.ko (=m) ..."
-          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out \
-            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0 \
-            M="$PWD/fs/nomount" modules
+          COMMON_FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          # 关键: modules_prepare 不生成 out/Module.symvers。
+          # 没有它 modpost 就没法解析符号版本, 生成的 ko 在设备上会报
+          # "disagrees about version of symbol" 或直接加载失败。
+          # vmlinux 的符号表来自 KBUILD_VMLINUX_OBJS 的 Module.symvers,
+          # 所以这里先编出 vmlinux 的 modpost 阶段 (build-in 编译, 不产出镜像)
+          echo ">>> 生成 out/Module.symvers (编译 vmlinux 的 modpost 阶段)..."
+          if [ ! -f out/Module.symvers ]; then
+            make -j"$(nproc)" $COMMON_FLAGS vmlinux.mod 2>/dev/null || \
+            make -j"$(nproc)" $COMMON_FLAGS modules 2>/dev/null || true
+          fi
+
+          if [ ! -f out/Module.symvers ]; then
+            echo "::warning::out/Module.symvers 仍未生成, 尝试完整 Image 构建以产生符号表"
+            make -j"$(nproc)" $COMMON_FLAGS Image || true
+          fi
+
+          echo "=== Module.symvers 状态 ==="
+          ls -lh out/Module.symvers 2>/dev/null || echo "缺失"
+          wc -l out/Module.symvers 2>/dev/null || true
+
+          echo ">>> 编译 nomount.ko ..."
+          make -j"$(nproc)" $COMMON_FLAGS M="$PWD/fs/nomount" modules
 
           echo ">>> 查找产物..."
-          find . -name 'nomount.ko' -o -name 'nomount.mod' | head -n 20
+          find . -name 'nomount.ko' 2>/dev/null | head -n 20
 
           if [ ! -f fs/nomount/nomount.ko ]; then
             echo "::error::未找到 nomount.ko"
-            echo "=== 最近的编译错误 ==="
-            true
             exit 1
           fi
 
@@ -362,7 +384,7 @@ jobs:
           OUT="$WORKDIR/artifacts"
           mkdir -p "$OUT"
 
-          FINAL="$OUT/${{ inputs.ko_name }}.ko"
+          FINAL="$OUT/${{ inputs.ko_name }}-${KERNELRELEASE}.ko"
 
           # 保留 .BTF 和符号信息: panic 排查需要. 仅做 basic strip
           cp "$KO" "$FINAL"
