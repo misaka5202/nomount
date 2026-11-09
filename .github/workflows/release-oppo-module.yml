@@ -251,96 +251,33 @@ jobs:
           done
           echo ">>> setlocalversion 输出已固定为: -$KSUFFIX"
           tail -n 3 common/scripts/setlocalversion
-
-      - name: 用运行内核的精确头文件替换开源树头文件
+      - name: 对齐 struct module 布局 (MITIGATION_ITS)
         run: |
           set -euo pipefail
           cd kernel_workspace/common
 
-          # 覆盖前先彻底清掉源码树里的构建产物，否则 kbuild 会拒绝重新配置
-          # （"The source tree is not clean, please run make mrproper"）。
-          rm -f .config .config.old .version Module.symvers modules.order
-          rm -rf include/config include/generated
-          echo ">>> 已清理源码树构建产物"
-
-          # 用运行内核自己的 include/ 覆盖开源树，这是让 struct module 等
-          # 结构的字段布局与设备一致的关键一步。
+          # 剔除注释后逐行比对设备 kheaders 与本树的 include/linux/module.h，
+          # struct module 的唯一实质差异是设备多出这一段:
           #
-          # 为什么必须这么做:
-          #   即使 .config 完全对齐(实测 MODULES/MODVERSIONS/FTRACE/
-          #   KALLSYMS_ALL/SYSFS 都是 y)，module_layout CRC 仍是
-          #     设备 0xea759d7f  vs  我们 0xa26bedb1
-          #   说明差异不在配置开关，而在类型定义本身。开源树是 6.1.134，
-          #   设备是 6.1.157，中间的 stable 回移改过 struct module 及其
-          #   引用的嵌套类型。
+          #   #ifdef CONFIG_MITIGATION_ITS
+          #           int its_num_pages;
+          #           void **its_page_array;
+          #   #endif
           #
-          # 头文件来源优先级:
-          #   1) 输入参数 device_headers_url（可用真实 URL 覆盖）
-          #   2) 仓库内的 device_kheaders.tar.xz（从设备
-          #      /sys/kernel/kheaders.tar.xz 导出，CONFIG_IKHEADERS 提供）
-          KH_URL="${{ inputs.device_headers_url }}"
-          if [ -n "$KH_URL" ]; then
-            echo ">>> 从 URL 下载设备头文件: $KH_URL"
-            curl -fsSL --retry 5 --retry-delay 5 -o kheaders.tar.xz "$KH_URL"
-          elif [ -f "$GITHUB_WORKSPACE/device_kheaders.tar.xz" ]; then
-            echo ">>> 使用仓库内的 device_kheaders.tar.xz"
-            cp -f "$GITHUB_WORKSPACE/device_kheaders.tar.xz" kheaders.tar.xz
-          else
-            echo "::warning::没有设备头文件，继续使用开源树的 include/"
-            exit 0
-          fi
-
-          ls -lh kheaders.tar.xz
-          rm -rf devheaders && mkdir -p devheaders
-          tar -xJf kheaders.tar.xz -C devheaders
-          echo "--- 包结构 ---"
-          ls devheaders
-
-          # 覆盖 include/（同名文件以设备为准，树独有的保留，避免破坏构建）
+          # 设备是 6.1.157, 本树是 6.1.134, 该 mitigation 由较新的 stable 引入,
+          # 所以树里既无这段字段也无对应 Kconfig。
           #
-          # 两处必须排除:
-          #   1) include/soc/oplus/* 在树里是符号链接（指向 ../../vendor/oplus/...），
-          #      kheaders 导出的是真实目录, cp 会报
-          #      "cannot overwrite non-directory with directory"。
-          #   2) include/generated/* 是上一次构建的产物 (autoconf.h/utsrelease.h 等),
-          #      放进源码树会让 kbuild 判定 "The source tree is not clean"。
-          #      这些文件必须由当前 .config 重新生成。
-          overlay_dir() {
-            local src="$1" dst="$2" n=0 s=0
-            [ -d "$src" ] || return 0
-            mkdir -p "$dst"
-            while IFS= read -r -d '' f; do
-              local rel="${f#$src/}"
-              case "$rel" in
-                generated/*|config/*) s=$((s+1)); continue ;;
-                # 这三个是开源树的预生成文件，末行带 SHA1 自校验(Kbuild cmd_check_sha1)，
-                # 覆盖成设备版本会触发 "has been modified" 错误。
-                # 它们只涉及 atomic 内联实现，与 struct/ABI 无关，保留树内原版。
-                linux/atomic/atomic-arch-fallback.h|linux/atomic/atomic-instrumented.h|linux/atomic/atomic-long.h)
-                  s=$((s+1)); continue ;;
-              esac
-              local tgt="$dst/$rel"
-              if [ -L "$tgt" ]; then s=$((s+1)); continue; fi
-              mkdir -p "$(dirname "$tgt")"
-              cp -f "$f" "$tgt" 2>/dev/null && n=$((n+1)) || s=$((s+1))
-            done < <(find "$src" -type f -print0)
-            echo "  $dst: 覆盖 $n 个, 跳过 $s 个"
-          }
+          # 这段字段决定 module_layout CRC:
+          #   设备 0xea759d7f  vs  本树 0xa26bedb1
+          # check_modstruct_version() 不匹配时返回 -ENOEXEC 且不打印任何日志;
+          # 强行改 CRC 会让 mod_sysfs_setup 越界 panic。所以必须让布局真正一致。
+          python3 "$GITHUB_WORKSPACE/scripts/patch_module_layout.py" .
 
-          overlay_dir devheaders/include "$(pwd)/include"
-          overlay_dir devheaders/arch/arm64/include "$(pwd)/arch/arm64/include"
-          echo "  atomic 头文件保持树内原版 (SHA1 自校验)"
+          echo "=== 确认字段已插入 ==="
+          grep -n -A3 'ifdef CONFIG_MITIGATION_ITS' include/linux/module.h || {
+            echo "::error::字段注入失败"; exit 1; }
 
-          echo "=== 覆盖后抽查 ==="
-          ls -l include/linux/module.h
-          echo "module.h 与设备是否同源:"
-          if cmp -s devheaders/include/linux/module.h include/linux/module.h; then
-            echo "  OK: 已完全一致"
-          else
-            echo "  WARN: 不一致, 需检查符号链接冲突"
-          fi
-          echo "include/ 文件统计: $(find include -type f | wc -l) 个"
-          rm -rf devheaders kheaders.tar.xz
+
 
       - name: 挂载 nomount 源码
         run: |
