@@ -1,0 +1,522 @@
+name: release module (OPPO source build)
+
+# 用适配 OPPO 官方源码编译出的 nomount.ko，替换模块包里的通用 LKM，
+# 重新打包成可直接刷入的 NoMount 模块。
+#
+# 与官方 release 的区别只有一处：lkm/ 里的 nomount.ko 是用 OPPO
+# mt6989 官方内核源码树（含 vendor/oplus）编译的，因此
+#   - struct file_operations / inode_operations 等字段偏移与设备内核一致
+#   - __versions 段带本机内核的符号 CRC
+#   - vermagic 与设备内核匹配
+# 官方 DDK 容器编出的通用 KO 这三点都满足不了，加载后容易 panic。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'OPPO 内核源码仓库'
+        required: false
+        type: string
+        default: 'oppo-source/android_kernel_oppo_mt6989'
+      kernel_branch:
+        description: 'OPPO 内核源码分支'
+        required: false
+        type: string
+        default: 'oppo/mt6989_b_16.0.0_find_x7'
+      modules_repo:
+        description: 'OPPO 内核模块仓库(提供 vendor/oplus)'
+        required: false
+        type: string
+        default: 'oppo-source/android_kernel_modules_oppo_mt6989'
+      modules_branch:
+        description: 'OPPO 内核模块分支'
+        required: false
+        type: string
+        default: 'oppo/mt6989_b_16.0.0_find_x7'
+      nomount_ref:
+        description: 'nomount 源码版本(留空用当前分支)'
+        required: false
+        type: string
+        default: ''
+      use_cached_symvers:
+        description: '复用已缓存的 vmlinux.symvers(跳过约15分钟的 vmlinux 编译)'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build-ko:
+    name: Build OPPO-adapted nomount.ko
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      kernelrelease: ${{ steps.krel.outputs.kernelrelease }}
+
+    steps:
+      - name: Checkout nomount
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 切换到指定 nomount 版本
+        if: inputs.nomount_ref != ''
+        run: |
+          git fetch --all --tags --quiet || true
+          git checkout "${{ inputs.nomount_ref }}"
+
+      - name: 缓存 Clang 工具链
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/clang20
+            kernel_workspace/build-tools
+          key: oppo-toolchain-clang20-r547379-v1
+
+      - name: 安装依赖 + 准备 Clang 工具链
+        run: |
+          set -euo pipefail
+          sudo apt-mark hold firefox libc-bin >/dev/null 2>&1 || true
+          sudo apt purge man-db >/dev/null 2>&1 || true
+          sudo rm -rf /var/lib/man-db/auto-update || true
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends \
+            binutils python-is-python3 libssl-dev libelf-dev zip
+
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          if [ -x clang20/bin/clang ] && [ -d build-tools/bin ]; then
+            echo ">>> 工具链缓存命中"
+            ./clang20/bin/clang --version | head -n1
+            exit 0
+          fi
+
+          TCL_BASE="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379"
+
+          fetch() {
+            local name="$1" out="$2" tries=8 i=1
+            local -a urls=(
+              "$TCL_BASE/$name"
+              "https://ghproxy.net/$TCL_BASE/$name"
+              "https://gh-proxy.com/$TCL_BASE/$name"
+            )
+            while [ "$i" -le "$tries" ]; do
+              local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  下载尝试 $i/$tries: $u"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$u" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::$name 下载失败 (第 $i/$tries 次)"
+              i=$((i+1)); sleep $((i * 3))
+            done
+            echo "::error::无法下载 $name"
+            return 1
+          }
+
+          mkdir -p clang20
+          fetch clang-r547379.zip clang.zip
+          unzip -q -o clang.zip -d clang20
+          rm -f clang.zip
+
+          fetch build-tools.zip build-tools.zip
+          unzip -q -o build-tools.zip
+          rm -f build-tools.zip
+
+          ./clang20/bin/clang --version | head -n1
+
+      - name: 缓存内核源码与 vendor
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/vendor
+          key: oppo-kernel-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v1
+
+      - name: 准备内核源码与 vendor
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          fetch() {
+            local name="$1" url="$2" out="$3" tries=8 i=1
+            local -a urls=("$url" "https://ghproxy.net/$url" "https://gh-proxy.com/$url")
+            while [ "$i" -le "$tries" ]; do
+              local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  下载尝试 $i/$tries: $u"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$u" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::$name 下载失败 (第 $i/$tries 次)"
+              i=$((i+1)); sleep $((i * 3))
+            done
+            echo "::error::无法下载 $name"
+            return 1
+          }
+
+          if [ -d common/fs ] && [ -d vendor/oplus/kernel ]; then
+            echo ">>> 内核源码与 vendor 缓存命中"
+          else
+            rm -rf common vendor
+
+            echo ">>> 下载内核树"
+            fetch kernel \
+              "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" \
+              common.zip
+            unzip -q -o common.zip
+            mv "$(find . -maxdepth 1 -type d -name 'android_kernel_*' | head -n1)" common
+            rm -f common.zip
+
+            echo ">>> 下载 OPPO 模块仓库"
+            fetch modules \
+              "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" \
+              modules.zip
+            unzip -q -o modules.zip
+            mv "$(find . -maxdepth 1 -type d -name 'android_kernel_modules_*' | head -n1)" modules
+            rm -f modules.zip
+
+            # drivers/soc/oplus/* 指向 ../../../../vendor/oplus/kernel/...
+            # 从 common/drivers/soc/oplus 上溯 4 级 = kernel_workspace/
+            cp -r modules/vendor vendor
+            rm -rf modules
+          fi
+
+          echo ">>> vendor: $(du -sh vendor 2>/dev/null | cut -f1)"
+
+      - name: 缓存内核符号表
+        id: symvers
+        uses: actions/cache@v5
+        with:
+          path: kernel_workspace/common/out/vmlinux.symvers
+          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v1
+
+      - name: 清理 ABI 文件并修正 vermagic 后缀
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          rm -f common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+            # setlocalversion 在非干净 tag 状态且 LOCALVERSION 未设置时会追加 "+"，
+            # 而 vermagic 带 "+" 会让设备 insmod 报 version magic mismatch 直接拒绝。
+            sed -i 's|res="$res${scm:++}"|res="$res"|' "$f"
+          done
+
+      - name: 生成 .config 并 modules_prepare
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          make -j"$(nproc)" $FLAGS gki_defconfig
+
+          # 官方树自带的 resolve_btfids/libbpf 在 Clang20 下必然编译失败，
+          # 且 nomount 不需要 BTF，直接关掉。
+          ./scripts/config --file out/.config -d DEBUG_INFO_BTF      || true
+          ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES || true
+          ./scripts/config --file out/.config -d DEBUG_INFO          || true
+          ./scripts/config --file out/.config -d PAHOLE              || true
+          make -j"$(nproc)" $FLAGS olddefconfig
+
+          make -j"$(nproc)" $FLAGS modules_prepare
+
+          ./scripts/config --file out/.config -m NOMOUNT
+
+          KREL="$(cat out/include/config/kernel.release 2>/dev/null || make -s O=out ARCH=arm64 LLVM=1 kernelrelease)"
+          echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
+          echo "内核版本: $KREL"
+
+      - name: 挂载 nomount 源码
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+
+          rm -rf fs/nomount && mkdir -p fs/nomount
+          cp -f "$GITHUB_WORKSPACE"/kernel/src/*.c \
+                "$GITHUB_WORKSPACE"/kernel/src/*.h \
+                "$GITHUB_WORKSPACE"/kernel/src/Makefile \
+                "$GITHUB_WORKSPACE"/kernel/src/Kconfig fs/nomount/
+
+          if ! grep -q 'fs/nomount/Kconfig' fs/Kconfig; then
+            awk '
+              /^endmenu/ { last = NR }
+              { lines[NR] = $0 }
+              END {
+                for (i = 1; i <= NR; i++) {
+                  if (i == last) print "source \"fs/nomount/Kconfig\""
+                  print lines[i]
+                }
+              }
+            ' fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+          fi
+
+          if ! grep -q 'nomount' fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          fi
+          ls -la fs/nomount
+
+      - name: 编译 nomount.ko
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
+          # 不会去读 out/vmlinux.symvers。没有这张 CRC 表，ko 的 __versions
+          # 段就是空的，设备上加载会失败或解析到错位函数指针而 panic。
+          if [ -s out/vmlinux.symvers ]; then
+            echo ">>> 符号表已存在: $(wc -l < out/vmlinux.symvers) 条"
+          else
+            echo ">>> 编译 vmlinux 以生成符号表 (约 15-20 分钟)..."
+            make -j"$(nproc)" $FLAGS vmlinux || true
+          fi
+
+          [ -s out/vmlinux.symvers ] || { echo "::error::符号表缺失"; exit 1; }
+          echo ">>> 符号表: $(wc -l < out/vmlinux.symvers) 条"
+
+          cp -f out/vmlinux.symvers fs/nomount/Module.symvers
+          cp -f out/vmlinux.symvers Module.symvers
+
+          export KBUILD_EXTRA_SYMBOLS="$PWD/out/vmlinux.symvers"
+          make -j"$(nproc)" $FLAGS M="$PWD/fs/nomount" modules
+
+          [ -f fs/nomount/nomount.ko ] || { echo "::error::未生成 nomount.ko"; exit 1; }
+          ls -lh fs/nomount/nomount.ko
+
+      - name: 校验 ko
+        id: verify
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+
+          cd kernel_workspace/common
+          KO=fs/nomount/nomount.ko
+
+          VERMAGIC=$(modinfo -F vermagic "$KO" 2>/dev/null || strings "$KO" | grep -m1 'vermagic=' | sed 's/vermagic=//')
+          echo "vermagic: $VERMAGIC"
+
+          case "$VERMAGIC" in
+            *"+"*)
+              echo "::error::vermagic 含 '+', 设备 insmod 会拒绝加载"
+              exit 1
+              ;;
+          esac
+          echo "  OK: vermagic 无 '+'"
+
+          VERS=$(llvm-objdump -h "$KO" 2>/dev/null | grep '__versions' | head -n1 || true)
+          [ -n "$VERS" ] || { echo "::error::ko 缺少 __versions 段"; exit 1; }
+          VERS_SIZE=$((16#$(echo "$VERS" | awk '{print $3}')))
+          echo "  __versions 段: $VERS_SIZE 字节 (~$((VERS_SIZE / 64)) 条 CRC)"
+          [ "$VERS_SIZE" -gt 0 ] || { echo "::error::__versions 段为空"; exit 1; }
+
+          MISSING=0
+          for sym in d_lookup d_splice_alias d_add iget5_locked register_key_type \
+                     generic_file_mmap generic_file_read_iter vfs_getattr \
+                     notify_change kill_anon_super deactivate_locked_super; do
+            grep -qE "\b${sym}\b" out/vmlinux.symvers || { echo "  MISSING $sym"; MISSING=$((MISSING+1)); }
+          done
+          echo "  缺失关键符号: $MISSING"
+          [ "$MISSING" -eq 0 ] || { echo "::error::关键 VFS 符号缺失"; exit 1; }
+
+          echo "KO_VERMAGIC=$VERMAGIC" >> "$GITHUB_ENV"
+
+      - name: 记录内核版本
+        id: krel
+        run: |
+          echo "kernelrelease=$KERNELRELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: 上传 ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: nomount-ko-oppo
+          path: kernel_workspace/common/fs/nomount/nomount.ko
+          archive: false
+
+  release:
+    name: Pack and release module
+    needs: build-ko
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout nomount
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 切换 nomount 版本
+        if: inputs.nomount_ref != ''
+        run: |
+          git fetch --all --tags --quiet || true
+          git checkout "${{ inputs.nomount_ref }}"
+
+      - name: 安装打包依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zip jq
+
+      - name: 下载适配的 ko
+        uses: actions/download-artifact@v7
+        with:
+          name: nomount-ko-oppo
+          path: ./ko
+
+      - name: 准备模块目录
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cp -a module build/nomount
+          cd build/nomount
+
+          # 清掉官方预置的通用 LKM（如果有）
+          rm -rf lkm
+          mkdir -p lkm
+
+          # Ko 命名必须符合 customize.sh 的查找规则:
+          #   EXACT = lkm/nomount-${AKVER}-${KVER}${ARCH_SFX}.ko
+          #   KVER  = uname -r 前两段, 这里是 6.1
+          #   AKVER = uname -r 里的 androidN, OPPO 内核可能没有这一段
+          # 两种都放一份, 保证任何分支都能命中.
+          KREL="${{ needs.build-ko.outputs.kernelrelease }}"
+          KVER="$(echo "$KREL" | cut -d'.' -f1,2)"
+          echo "KERNELRELEASE=$KREL  KVER=$KVER"
+
+          cp "$GITHUB_WORKSPACE/ko/nomount.ko" "lkm/nomount-android14-${KVER}.ko"
+          cp "$GITHUB_WORKSPACE/ko/nomount.ko" "lkm/nomount-${KVER}.ko"
+
+          ls -lh lkm/
+
+      - name: 修改 module.prop 标识
+        run: |
+          set -euo pipefail
+          cd build/nomount
+
+          KREL="${{ needs.build-ko.outputs.kernelrelease }}"
+          BASE_VER="$(sed -n 's/^version=//p' module.prop | tr -d '\r ')"
+          DESC="NoMount metamodule with a kernel driver built against the OPPO MT6989 open-source kernel tree (${KREL}). Replaces OverlayFS/MagicMount with VFS path redirection."
+
+          sed -i "s|^name=.*|name=NoMount (OPPO source)|" module.prop
+          sed -i "s|^version=.*|version=${BASE_VER} (OPPO-source ${KREL})|" module.prop
+          sed -i "s|^description=.*|description=${DESC}|" module.prop
+          # 不跟随上游 updateJson, 避免被官方版本覆盖回通用 KO
+          sed -i "/^updateJson=/d" module.prop
+
+          echo "=== module.prop ==="
+          cat module.prop
+
+      - name: 打包模块 zip
+        id: pack
+        run: |
+          set -euo pipefail
+          KREL="${{ needs.build-ko.outputs.kernelrelease }}"
+          KVER="$(echo "$KREL" | cut -d'.' -f1,2)"
+          SHORT="$(git rev-parse --short HEAD)"
+          BASE_VER="$(sed -n 's/^version=//p' build/nomount/module.prop | tr -d '\r ' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+          [ -n "$BASE_VER" ] || BASE_VER="v2.2.0"
+
+          TAG="NoMount-${BASE_VER}-oppo-mt6989-k${KVER}-${SHORT}"
+          ZIP="${TAG}.zip"
+
+          cd build/nomount
+          zip -qr9 "../../${ZIP}" .
+          cd ../..
+
+          ls -lh "$ZIP"
+          unzip -l "$ZIP" | head -n 25
+
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 生成发布说明
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          ### NoMount — OPPO 源码适配版
+
+          本包的 `lkm/nomount.ko` **不是**官方那份用 GKI DDK 容器编译的通用模块，
+          而是直接用 OPPO 官方开源源码树编译出来的。
+
+          #### 为什么要单独编译
+
+          NoMount 工作在 VFS 层，运行时会直接替换目标目录的
+          `inode->i_op` / `i_fop` / `sb->s_op`，并用 `container_of`
+          从成员地址反推结构体基址。因此只要结构体字段偏移与本机内核
+          有任何差异，写进去的就是错位的函数指针，内核一旦调用即 panic。
+
+          官方通用 KO 在以下三点上可能与 OPPO 内核不匹配：
+
+          | 项目 | 官方通用 KO | 本包 |
+          |---|---|---|
+          | 头文件来源 | GKI 通用 `include/linux/fs.h` | OPPO 官方树同一份 |
+          | 符号 CRC | GKI 的 `Module.symvers` | 本机 `vmlinux.symvers` |
+          | vermagic | GKI KMI 格式 | 与本机内核完全一致 |
+
+          #### 构建信息
+
+          - 内核源码：`${{ inputs.kernel_repo }}` @ `${{ inputs.kernel_branch }}`
+          - 模块源码：`${{ inputs.modules_repo }}` @ `${{ inputs.modules_branch }}`
+          - 内核版本：`${{ needs.build-ko.outputs.kernelrelease }}`
+          - nomount：`${{ github.sha }}`
+          - 工具链：Clang 20 (Android r547379)
+
+          #### 校验结果
+
+          - vermagic 不含 `+`（否则 insmod 会报 version magic mismatch）
+          - `__versions` 段非空（符号 CRC 已正确写入）
+          - 11 个关键 VFS 符号在符号表中全部可解析
+
+          #### 安装
+
+          用 KernelSU / APatch 管理器直接刷入本 zip，重启即可。
+          该模块为 metamodule，用于接管其他模块的挂载过程。
+
+          #### 注意
+
+          - 首次刷入前请备份 `boot` 分区
+          - 若 ko 加载失败，模块会尝试回滚到上一个可用版本；
+            仍失败则不启用，不会导致 bootloop
+          - 内核版本不匹配时（例如系统 OTA 后内核变了）需要重新编译
+          EOF
+          cat notes.md
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.pack.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "NoMount OPPO-source (${{ needs.build-ko.outputs.kernelrelease }})" \
+            --notes-file notes.md \
+            "${{ steps.pack.outputs.zip }}"
+
+      - name: 上传 zip 工件
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pack.outputs.tag }}
+          path: ${{ steps.pack.outputs.zip }}
+          archive: false
