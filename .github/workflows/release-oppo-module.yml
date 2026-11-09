@@ -143,6 +143,7 @@ jobs:
           path: |
             kernel_workspace/common
             kernel_workspace/vendor
+            kernel_workspace/device_config
           key: oppo-kernel-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v1
 
       - name: 准备内核源码与 vendor
@@ -192,6 +193,13 @@ jobs:
             # drivers/soc/oplus/* 指向 ../../../../vendor/oplus/kernel/...
             # 从 common/drivers/soc/oplus 上溯 4 级 = kernel_workspace/
             cp -r modules/vendor vendor
+
+            # 抽取出货内核的真实配置链（见 modules 仓库 kernel/build/bazel_mgk_rules/mgk.bzl
+            # 474-493 行: gki_defconfig + mgk_64_k61_defconfig + oplus6989.config 经
+            # merge_config.sh -m -r 合成; oplus_setup.sh 确认 Find X7 平台 = k6989v1_64）
+            mkdir -p device_config
+            cp -f modules/kernel/kernel_device_modules-6.1/arch/arm64/configs/mgk_64_k61_defconfig device_config/
+            cp -f modules/kernel/kernel_device_modules-6.1/kernel/configs/oplus6989.config device_config/
             rm -rf modules
           fi
 
@@ -202,7 +210,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: kernel_workspace/common/out/vmlinux.symvers
-          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v1
+          # v2: 配置链改为出货内核真实组合(gki+mgk+oplus6989), CRC 随配置变化, 必须重算
+          key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-mgk-v2
 
       - name: 清理 ABI 文件并对齐设备内核版本
         run: |
@@ -254,10 +263,29 @@ jobs:
             CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
-          make -j"$(nproc)" $FLAGS gki_defconfig
+          # 复刻出货内核的真实配置链（modules 仓库 kernel/build/bazel_mgk_rules/mgk.bzl
+          # 474-493 行 + oplus_setup.sh OPLUS_PLATFORM_INFO=k6989v1_64）:
+          #   gki_defconfig + mgk_64_k61_defconfig + oplus6989.config
+          # 经 merge_config.sh -m -r 合成，user 变体不加 eng/userdebug fragment。
+          # 之前只用裸 gki_defconfig，缺 MTK/oplus 配置导致 struct 布局与
+          # module_layout CRC 和设备内核不一致，insmod 静默返回 ENOEXEC。
+          cp -f ../device_config/mgk_64_k61_defconfig arch/arm64/configs/
+          mkdir -p kernel/configs
+          cp -f ../device_config/oplus6989.config kernel/configs/
+          KCONFIG_CONFIG=arch/arm64/configs/mgk_64_k61_merged_defconfig \
+            scripts/kconfig/merge_config.sh -m -r \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/mgk_64_k61_defconfig \
+            kernel/configs/oplus6989.config
+          [ -s arch/arm64/configs/mgk_64_k61_merged_defconfig ] || {
+            echo "::error::merge_config 失败"; exit 1; }
+          echo ">>> 合成配置行数: $(wc -l < arch/arm64/configs/mgk_64_k61_merged_defconfig)"
+
+          # defconfig 目标以合成文件为基底生成 out/.config
+          make -j"$(nproc)" $FLAGS mgk_64_k61_merged_defconfig
 
           # 官方树自带的 resolve_btfids/libbpf 在 Clang20 下必然编译失败，
-          # 且 nomount 不需要 BTF，直接关掉。
+          # 且 nomount 不需要 BTF，直接关掉（BTF 不参与 genksyms CRC，可安全关闭）。
           # NOMOUNT 必须在这里（olddefconfig 之前）写入，这样 include/config/auto.conf
           # 才会带上它。如果在 modules_prepare 之后才改 .config，auto.conf 是旧的，
           # obj-$(CONFIG_NOMOUNT) 展开为空，make 会认为无事可做，直接跳过编译。
@@ -275,6 +303,8 @@ jobs:
             echo "::error::auto.conf 里没有 CONFIG_NOMOUNT"
             exit 1
           }
+          echo "=== 抽查关键配置是否与设备一致 ==="
+          grep -E '^CONFIG_(ARCH_MEDIATEK|ABI_MONITOR|OPLUS_FEATURE_SCHED_ASSIST|MTK_|MODVERSIONS)=' out/include/config/auto.conf | head -n 15 || true
 
           KREL="$(cat out/include/config/kernel.release 2>/dev/null || make -s O=out ARCH=arm64 LLVM=1 kernelrelease)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
@@ -553,6 +583,7 @@ jobs:
           | 模块分支 | `${{ inputs.modules_branch }}` |
           | 内核版本 | `${{ needs.build-ko.outputs.kernelrelease }}`（对齐设备 `uname -r`） |
           | 设备内核 | `${{ inputs.device_kernelrelease }}` |
+          | 配置链 | `gki_defconfig + mgk_64_k61_defconfig + oplus6989.config`（出货内核同款） |
           | 工具链 | Clang 20 (Android r547379) |
           | nomount | `${{ github.sha }}` |
 
