@@ -274,7 +274,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/patch_module_layout.py" .
 
           echo "=== 确认字段已插入 ==="
-          grep -n -A3 'ifdef CONFIG_MITIGATION_ITS' include/linux/module.h || {
+          grep -n -B1 -A2 'its_num_pages' include/linux/module.h || {
             echo "::error::字段注入失败"; exit 1; }
 
 
