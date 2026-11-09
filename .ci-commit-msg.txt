@@ -1,0 +1,32 @@
+ci: build against the device's full .config instead of gki_defconfig
+
+The panic log settled it. Right before the oops the kernel was walking
+our module's __this_module, and the fault landed in:
+
+    pc : mod_sysfs_setup+0x218/0x2ec
+    x1 : ... 6f6d6f6e 00746e75 ...   ("nomount")
+
+So mod_sysfs_setup() dereferenced a struct module laid out by a
+different build than the one it is running on. The CRC override in the
+previous commit did not fix that mismatch, it merely switched off the
+guard that existed to catch it, which is why the module now panics
+instead of erroring out.
+
+The real fix is to compile with the same struct layouts. Dumped from
+the device:
+
+  /proc/config.gz           -> 3094 effective options
+  /sys/kernel/kheaders.tar.xz -> the running kernel's own include/ tree
+
+and verified gki_defconfig (666 options) is a strict subset of the
+device config with zero conflicting values. The device config therefore
+is a safe, exact baseline -- no merge heuristics needed.
+
+Changes:
+ - commit the device config as device_full.config and generate
+   out/.config directly from it
+ - keep a device-header overlay input for the include/ tree
+ - gate the CRC patch behind patch_crc (default false, diagnostic only)
+ - bump the symvers cache key to v3 since every CRC changes
+ - make the verify step treat a module_layout mismatch as fatal with an
+   explicit warning that faking it leads to a panic, not a fix
