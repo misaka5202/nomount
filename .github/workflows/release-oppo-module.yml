@@ -313,6 +313,11 @@ jobs:
               local rel="${f#$src/}"
               case "$rel" in
                 generated/*|config/*) s=$((s+1)); continue ;;
+                # 这三个是开源树的预生成文件，末行带 SHA1 自校验(Kbuild cmd_check_sha1)，
+                # 覆盖成设备版本会触发 "has been modified" 错误。
+                # 它们只涉及 atomic 内联实现，与 struct/ABI 无关，保留树内原版。
+                linux/atomic/atomic-arch-fallback.h|linux/atomic/atomic-instrumented.h|linux/atomic/atomic-long.h)
+                  s=$((s+1)); continue ;;
               esac
               local tgt="$dst/$rel"
               if [ -L "$tgt" ]; then s=$((s+1)); continue; fi
@@ -324,16 +329,7 @@ jobs:
 
           overlay_dir devheaders/include "$(pwd)/include"
           overlay_dir devheaders/arch/arm64/include "$(pwd)/arch/arm64/include"
-
-          # include/linux/atomic/*.h 由树内脚本生成，Kbuild 对它们做 SHA1 校验
-          # (scripts/atomic/check-atomics.sh)，kheaders 里带的是设备那次生成的
-          # 结果，与当前脚本输出不一致会直接报:
-          #   error: ../include/linux/atomic/atomic-arch-fallback.h has been modified.
-          # 这三个文件与 ABI 无关，删掉让 kbuild 用树里的脚本重新生成即可。
-          rm -f include/linux/atomic/atomic-arch-fallback.h \
-                include/linux/atomic/atomic-instrumented.h \
-                include/linux/atomic/atomic-long.h
-          echo "  已移除 atomic 生成头文件, 交由 kbuild 重新生成"
+          echo "  atomic 头文件保持树内原版 (SHA1 自校验)"
 
           echo "=== 覆盖后抽查 ==="
           ls -l include/linux/module.h
