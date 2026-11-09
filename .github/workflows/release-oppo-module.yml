@@ -335,34 +335,52 @@ jobs:
           #
           # 已验证 gki_defconfig 是设备 config 的纯子集且零值冲突，因此直接以
           # 设备 config 为基线是安全的，不需要任何 merge 猜测。
-          cp -f "$GITHUB_WORKSPACE/device_full.config" arch/arm64/configs/device_defconfig
+          # 直接用设备 config 作为 out/.config，不走 make <name>_defconfig。
+          #
+          # 原因: make xxx_defconfig 内部会跑一遍 Kconfig 解析，设备 config 里
+          # 那 2428 个 vendor 专属符号在 common/ 树里没有定义，Kconfig 会把它们
+          # 连同被牵连的通用项一起重置 —— 实测 CONFIG_MODULES / MODVERSIONS /
+          # MODULE_UNLOAD / KALLSYMS_ALL / FTRACE 全被关掉，连模块都编不出来。
+          #
+          # 直接把设备 config 放成 out/.config，再用 scripts/config 打补丁，
+          # 最后由 syncconfig 只做 include/config/auto.conf 的生成，不做裁决策。
+          mkdir -p out
+          cp -f "$GITHUB_WORKSPACE/device_full.config" out/.config
 
           # 设备 config 里 CONFIG_MODULE_SIG_KEY 指向打包时才知道的路径，
-          # 且 CONFIG_MODULE_SIG_ALL 未开启（模块不签名），这里对齐为不指定密钥。
-          sed -i -E 's|^CONFIG_MODULE_SIG_KEY=.*|# CONFIG_MODULE_SIG_KEY is not set|' \
-            arch/arm64/configs/device_defconfig
+          # 且 CONFIG_MODULE_SIG_ALL 未开启（模块不签名），对齐为不指定密钥。
+          sed -i -E 's|^CONFIG_MODULE_SIG_KEY=.*|# CONFIG_MODULE_SIG_KEY is not set|' out/.config
 
-          make -j"$(nproc)" $FLAGS device_defconfig
+          # BTF 相关：不参与 genksyms CRC，关闭不影响 ABI。
+          # NOMOUNT 必须在此写入；fs/nomount/Kconfig 已在前一步挂载。
+          ./scripts/config --file out/.config \
+            -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -d DEBUG_INFO -d PAHOLE \
+            -m NOMOUNT
 
-          # BTF 相关：设备 HEADERS 里没有 resolve_btfids 所需的完整工具链，
-          # 且 BTF 不参与 genksyms CRC，关闭不影响 ABI。
-          # NOMOUNT 必须在 olddefconfig 之前写入；fs/nomount/Kconfig 已在前一步挂载，
-          # 否则 Kconfig 不认识该符号，olddefconfig 会静默丢弃。
-          ./scripts/config --file out/.config -d DEBUG_INFO_BTF      || true
-          ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES || true
-          ./scripts/config --file out/.config -d DEBUG_INFO          || true
-          ./scripts/config --file out/.config -d PAHOLE              || true
-          ./scripts/config --file out/.config -m NOMOUNT             || true
-
-          make -j"$(nproc)" $FLAGS olddefconfig
+          # syncconfig 生成 auto.conf（会做一次依赖检查，但不改 .config 里
+          # 已显式设置的值）
+          make -j"$(nproc)" $FLAGS syncconfig
 
           echo "=== 配置与设备一致性核对 ==="
-          # 关键: struct module 的条件字段开关必须与设备完全一致
-          for k in CONFIG_SYSFS CONFIG_FTRACE CONFIG_MODULE_UNLOAD CONFIG_KALLSYMS_ALL \
-                   CONFIG_CFI_CLANG CONFIG_TRACEPOINTS CONFIG_JUMP_LABEL CONFIG_MODVERSIONS; do
-            got=$(grep "^${k}=" out/.config || echo "# ${k} is not set")
-            echo "  $got"
+          MISS=0
+          for k in CONFIG_MODULES CONFIG_SYSFS CONFIG_FTRACE CONFIG_MODULE_UNLOAD \
+                   CONFIG_KALLSYMS_ALL CONFIG_CFI_CLANG CONFIG_TRACEPOINTS \
+                   CONFIG_JUMP_LABEL CONFIG_MODVERSIONS CONFIG_ARM64; do
+            if grep -q "^${k}=y" out/.config; then
+              echo "  OK    $k=y"
+            else
+              echo "  MISS  $k"
+              case "$k" in
+                CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_MODULE_UNLOAD|CONFIG_ARM64) MISS=1 ;;
+              esac
+            fi
           done
+          [ "$MISS" -eq 0 ] || {
+            echo "::error::关键配置缺失, 该配置无法产出可用模块"
+            echo "--- .config 中相关行 ---"
+            grep -E '^#? ?CONFIG_(MODULES|MODVERSIONS|MODULE_UNLOAD|ARM64)\b' out/.config || true
+            exit 1
+          }
 
           make -j"$(nproc)" $FLAGS modules_prepare
 

@@ -1,32 +1,19 @@
-ci: build against the device's full .config instead of gki_defconfig
+ci: load the device config verbatim instead of via *_defconfig target
 
-The panic log settled it. Right before the oops the kernel was walking
-our module's __this_module, and the fault landed in:
+`make device_defconfig` reconciles the whole configuration against the
+tree's Kconfig before writing out/.config. The device config carries
+about 2400 vendor-only symbols that common/ has no Kconfig entry for,
+and the reconciliation cascades: MODULES, MODVERSIONS, MODULE_UNLOAD,
+KALLSYMS_ALL and FTRACE all came back disabled, so vmlinux refused to
+build at all with
 
-    pc : mod_sysfs_setup+0x218/0x2ec
-    x1 : ... 6f6d6f6e 00746e75 ...   ("nomount")
+    *** The present kernel configuration has modules disabled.
 
-So mod_sysfs_setup() dereferenced a struct module laid out by a
-different build than the one it is running on. The CRC override in the
-previous commit did not fix that mismatch, it merely switched off the
-guard that existed to catch it, which is why the module now panics
-instead of erroring out.
+Place the device config directly as out/.config and run syncconfig
+instead, which generates include/config/auto.conf without re-deriving
+every symbol.
 
-The real fix is to compile with the same struct layouts. Dumped from
-the device:
-
-  /proc/config.gz           -> 3094 effective options
-  /sys/kernel/kheaders.tar.xz -> the running kernel's own include/ tree
-
-and verified gki_defconfig (666 options) is a strict subset of the
-device config with zero conflicting values. The device config therefore
-is a safe, exact baseline -- no merge heuristics needed.
-
-Changes:
- - commit the device config as device_full.config and generate
-   out/.config directly from it
- - keep a device-header overlay input for the include/ tree
- - gate the CRC patch behind patch_crc (default false, diagnostic only)
- - bump the symvers cache key to v3 since every CRC changes
- - make the verify step treat a module_layout mismatch as fatal with an
-   explicit warning that faking it leads to a panic, not a fix
+Add an explicit gate on the options that must stay enabled (MODULES,
+MODVERSIONS, MODULE_UNLOAD, ARM64) and dump the offending lines on
+failure, so a silently reverted config cannot reach the compile step
+again.
