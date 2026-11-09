@@ -1,0 +1,11 @@
+﻿ci: overlay kheaders file-by-file, skipping symlinked targets
+
+cp -a devheaders/include/. common/include/ aborts on
+include/soc/oplus/storage: the open-source tree has that entry as a
+symlink into ../../vendor/oplus/..., while kheaders exports a real
+directory, so cp refuses with "cannot overwrite non-directory with
+directory".
+
+Walk the source tree and copy regular files one by one, leaving symlink
+targets untouched. Assert afterwards that module.h matches the device
+copy so a partial overlay cannot silently slip through.

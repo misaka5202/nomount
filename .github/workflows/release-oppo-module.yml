@@ -291,19 +291,38 @@ jobs:
           ls devheaders
 
           # 覆盖 include/（同名文件以设备为准，树独有的保留，避免破坏构建）
-          if [ -d devheaders/include ]; then
-            cp -a devheaders/include/. common/include/
-            echo "  已覆盖 common/include/"
-          fi
-          # arch/arm64/include 同样覆盖（asm/ 下也有影响 ABI 的定义）
-          if [ -d devheaders/arch/arm64/include ]; then
-            cp -a devheaders/arch/arm64/include/. common/arch/arm64/include/
-            echo "  已覆盖 common/arch/arm64/include/"
-          fi
+          #
+          # 不用 cp -a：开源树里 include/soc/oplus/* 等位置是符号链接
+          # （指向 ../../vendor/oplus/...），而 kheaders 导出的是真实目录，
+          # cp 会因 "cannot overwrite non-directory with directory" 失败。
+          # 这里逐文件覆盖，并跳过目标为符号链接的情况。
+          overlay_dir() {
+            local src="$1" dst="$2" n=0 s=0
+            [ -d "$src" ] || return 0
+            mkdir -p "$dst"
+            while IFS= read -r -d '' f; do
+              local rel="${f#$src/}"
+              local tgt="$dst/$rel"
+              if [ -L "$tgt" ]; then
+                s=$((s+1)); continue
+              fi
+              mkdir -p "$(dirname "$tgt")"
+              cp -f "$f" "$tgt" 2>/dev/null && n=$((n+1)) || s=$((s+1))
+            done < <(find "$src" -type f -print0)
+            echo "  $dst: 覆盖 $n 个, 跳过 $s 个"
+          }
+
+          overlay_dir devheaders/include "$(pwd)/common/include"
+          overlay_dir devheaders/arch/arm64/include "$(pwd)/common/arch/arm64/include"
 
           echo "=== 覆盖后抽查 ==="
           ls -l common/include/linux/module.h
-          grep -c 'CONFIG_MITIGATION_ITS' common/include/linux/module.h || true
+          echo "module.h 与设备是否同源:"
+          if cmp -s devheaders/include/linux/module.h common/include/linux/module.h; then
+            echo "  OK: 已完全一致"
+          else
+            echo "  WARN: 不一致, 需检查符号链接冲突"
+          fi
 
       - name: 挂载 nomount 源码
         run: |
