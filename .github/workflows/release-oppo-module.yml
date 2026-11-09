@@ -355,7 +355,6 @@ jobs:
         with:
           name: nomount-ko-oppo
           path: kernel_workspace/common/fs/nomount/nomount.ko
-          archive: false
 
   release:
     name: Pack and release module
@@ -388,6 +387,12 @@ jobs:
       - name: 准备模块目录
         run: |
           set -euo pipefail
+
+          # artifact 现在是打包上传, 先解开找到 nomount.ko
+          KO_SRC="$(find ./ko -name 'nomount.ko' | head -n1)"
+          [ -n "$KO_SRC" ] || { echo "::error::artifact 里没有 nomount.ko"; ls -R ./ko; exit 1; }
+          echo "ko: $KO_SRC ($(stat -c%s "$KO_SRC") bytes)"
+
           mkdir -p build
           cp -a module build/nomount
           cd build/nomount
@@ -405,8 +410,8 @@ jobs:
           KVER="$(echo "$KREL" | cut -d'.' -f1,2)"
           echo "KERNELRELEASE=$KREL  KVER=$KVER"
 
-          cp "$GITHUB_WORKSPACE/ko/nomount.ko" "lkm/nomount-android14-${KVER}.ko"
-          cp "$GITHUB_WORKSPACE/ko/nomount.ko" "lkm/nomount-${KVER}.ko"
+          cp "$KO_SRC" "lkm/nomount-android14-${KVER}.ko"
+          cp "$KO_SRC" "lkm/nomount-${KVER}.ko"
 
           ls -lh lkm/
 
@@ -417,12 +422,10 @@ jobs:
 
           KREL="${{ needs.build-ko.outputs.kernelrelease }}"
           BASE_VER="$(sed -n 's/^version=//p' module.prop | tr -d '\r ')"
-          DESC="NoMount metamodule with a kernel driver built against the OPPO MT6989 open-source kernel tree (${KREL}). Replaces OverlayFS/MagicMount with VFS path redirection."
 
-          sed -i "s|^name=.*|name=NoMount (OPPO source)|" module.prop
-          sed -i "s|^version=.*|version=${BASE_VER} (OPPO-source ${KREL})|" module.prop
-          sed -i "s|^description=.*|description=${DESC}|" module.prop
-          # 不跟随上游 updateJson, 避免被官方版本覆盖回通用 KO
+          # 版本号追加构建号, 保持与上游一致的展示形式
+          sed -i "s|^version=.*|version=${BASE_VER} (${KREL})|" module.prop
+          # 不跟随上游 updateJson, 否则管理器会把这份适配版覆盖回通用 KO
           sed -i "/^updateJson=/d" module.prop
 
           echo "=== module.prop ==="
@@ -432,13 +435,11 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          KREL="${{ needs.build-ko.outputs.kernelrelease }}"
-          KVER="$(echo "$KREL" | cut -d'.' -f1,2)"
           SHORT="$(git rev-parse --short HEAD)"
           BASE_VER="$(sed -n 's/^version=//p' build/nomount/module.prop | tr -d '\r ' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
           [ -n "$BASE_VER" ] || BASE_VER="v2.2.0"
 
-          TAG="NoMount-${BASE_VER}-oppo-mt6989-k${KVER}-${SHORT}"
+          TAG="NoMount-${BASE_VER}-${SHORT}"
           ZIP="${TAG}.zip"
 
           cd build/nomount
@@ -446,60 +447,66 @@ jobs:
           cd ../..
 
           ls -lh "$ZIP"
-          unzip -l "$ZIP" | head -n 25
+          echo "--- zip 内容 ---"
+          unzip -l "$ZIP"
 
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "basever=$BASE_VER" >> "$GITHUB_OUTPUT"
 
       - name: 生成发布说明
         run: |
           set -euo pipefail
           cat > notes.md <<'EOF'
-          ### NoMount — OPPO 源码适配版
+          ### NoMount ${{ steps.pack.outputs.basever }}
 
-          本包的 `lkm/nomount.ko` **不是**官方那份用 GKI DDK 容器编译的通用模块，
-          而是直接用 OPPO 官方开源源码树编译出来的。
+          #### 本版说明
 
-          #### 为什么要单独编译
+          本包的 `lkm/nomount.ko` 使用 **OPPO 官方开源源码树**编译，
+          而非上游 release 里那份由 GKI DDK 容器生成的通用模块。
 
           NoMount 工作在 VFS 层，运行时会直接替换目标目录的
-          `inode->i_op` / `i_fop` / `sb->s_op`，并用 `container_of`
+          `inode->i_op` / `i_fop` / `sb->s_op`，并通过 `container_of`
           从成员地址反推结构体基址。因此只要结构体字段偏移与本机内核
           有任何差异，写进去的就是错位的函数指针，内核一旦调用即 panic。
+          这正是通用 KO 在厂商魔改内核上容易崩溃的原因。
 
-          官方通用 KO 在以下三点上可能与 OPPO 内核不匹配：
-
-          | 项目 | 官方通用 KO | 本包 |
+          | 项目 | 上游通用 KO | 本包 |
           |---|---|---|
-          | 头文件来源 | GKI 通用 `include/linux/fs.h` | OPPO 官方树同一份 |
+          | 头文件来源 | GKI 通用 `include/linux/fs.h` | 厂商官方树同一份 |
           | 符号 CRC | GKI 的 `Module.symvers` | 本机 `vmlinux.symvers` |
-          | vermagic | GKI KMI 格式 | 与本机内核完全一致 |
+          | vermagic | GKI KMI 格式 | 与本机内核一致 |
 
-          #### 构建信息
+          #### 适配信息
 
-          - 内核源码：`${{ inputs.kernel_repo }}` @ `${{ inputs.kernel_branch }}`
-          - 模块源码：`${{ inputs.modules_repo }}` @ `${{ inputs.modules_branch }}`
-          - 内核版本：`${{ needs.build-ko.outputs.kernelrelease }}`
-          - nomount：`${{ github.sha }}`
-          - 工具链：Clang 20 (Android r547379)
+          | 项 | 值 |
+          |---|---|
+          | 内核源码 | `${{ inputs.kernel_repo }}` |
+          | 内核分支 | `${{ inputs.kernel_branch }}` |
+          | 模块源码 | `${{ inputs.modules_repo }}` |
+          | 模块分支 | `${{ inputs.modules_branch }}` |
+          | 内核版本 | `${{ needs.build-ko.outputs.kernelrelease }}` |
+          | 工具链 | Clang 20 (Android r547379) |
+          | nomount | `${{ github.sha }}` |
 
-          #### 校验结果
+          #### 质量校验（构建时强制）
 
-          - vermagic 不含 `+`（否则 insmod 会报 version magic mismatch）
-          - `__versions` 段非空（符号 CRC 已正确写入）
+          - `vermagic` 不含 `+`，否则设备 `insmod` 会报 version magic mismatch
+          - `__versions` 段非空，确符号 CRC 已写入
           - 11 个关键 VFS 符号在符号表中全部可解析
+
+          任一项不满足，构建会直接失败，不会产出发布包。
 
           #### 安装
 
-          用 KernelSU / APatch 管理器直接刷入本 zip，重启即可。
-          该模块为 metamodule，用于接管其他模块的挂载过程。
+          用 KernelSU / APatch 管理器刷入本 zip 后重启。
+          该模块是 metamodule，会接管其他模块的挂载过程。
 
           #### 注意
 
-          - 首次刷入前请备份 `boot` 分区
-          - 若 ko 加载失败，模块会尝试回滚到上一个可用版本；
-            仍失败则不启用，不会导致 bootloop
-          - 内核版本不匹配时（例如系统 OTA 后内核变了）需要重新编译
+          - 刷入前请备份 `boot` 等启动分区
+          - 模块自带 bootloop 保护：KO 加载失败会回滚到上一个可用版本
+          - 系统 OTA 更新内核后需重新编译本模块
           EOF
           cat notes.md
 
@@ -510,7 +517,7 @@ jobs:
           set -euo pipefail
           gh release create "${{ steps.pack.outputs.tag }}" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "NoMount OPPO-source (${{ needs.build-ko.outputs.kernelrelease }})" \
+            --title "${{ steps.pack.outputs.tag }}" \
             --notes-file notes.md \
             "${{ steps.pack.outputs.zip }}"
 
@@ -519,4 +526,3 @@ jobs:
         with:
           name: ${{ steps.pack.outputs.tag }}
           path: ${{ steps.pack.outputs.zip }}
-          archive: false
