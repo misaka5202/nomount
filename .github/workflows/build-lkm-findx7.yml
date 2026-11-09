@@ -216,19 +216,17 @@ jobs:
             CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
-          PREPARE_OK=0
-          if make -j"$(nproc)" $COMMON_FLAGS modules_prepare; then
-            PREPARE_OK=1
-          fi
+          # 先关掉 BTF: 官方树自带的 resolve_btfids/libbpf 在 Clang20 下必然编译失败,
+          # 与其先失败一轮再降级, 不如直接跳过. nomount.ko 本身不需要 BTF,
+          # 没有 BTF 只是少了 pahole 结构体信息, 不影响加载和运行.
+          echo ">>> 关闭 DEBUG_INFO_BTF / resolve_btfids (Clang20 兼容性问题)"
+          ./scripts/config --file out/.config -d DEBUG_INFO_BTF || true
+          ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES || true
+          ./scripts/config --file out/.config -d DEBUG_INFO || true
+          ./scripts/config --file out/.config -d PAHOLE || true
+          make -j"$(nproc)" $COMMON_FLAGS olddefconfig
 
-          if [ "$PREPARE_OK" -eq 0 ]; then
-            echo "::warning::modules_prepare 首次失败, 降级: 关闭 BTF 与 resolve_btfids 后重试"
-            ./scripts/config --file out/.config -d DEBUG_INFO_BTF
-            ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES
-            ./scripts/config --file out/.config -d PAHOLE
-            make -j"$(nproc)" $COMMON_FLAGS olddefconfig
-            make -j"$(nproc)" $COMMON_FLAGS modules_prepare
-          fi
+          make -j"$(nproc)" $COMMON_FLAGS modules_prepare
 
           echo ">>> modules_prepare 完成"
           # 记录内核版本，用于 ko 命名
@@ -313,14 +311,14 @@ jobs:
           #
           # 正解: 先编出 vmlinux.o (KBUILD_VMLINUX_OBJS 的全部 build-in 对象),
           # 这样 modpost 走 vmlinux.symvers 分支, Module.symvers 才会生成。
-          echo ">>> 生成 out/Module.symvers (需要 vmlinux.o)..."
+          echo ">>> 生成 out/Module.symvers (需要 vmlinux 的 modpost 阶段)..."
           if [ ! -f out/Module.symvers ]; then
-            if [ ! -f out/vmlinux.o ]; then
-              echo "    编译 vmlinux.o (build-in 对象, 不含驱动镜像)..."
-              make -j"$(nproc)" $COMMON_FLAGS vmlinux.o
-            fi
-            echo "    触发 modpost 生成 Module.symvers..."
-            make -j"$(nproc)" $COMMON_FLAGS modules
+            # 注意: vmlinux.o 在 O= 外部构建时不是合法顶层 target
+            # ("No rule to make target 'vmlinux.o'"), 但 vmlinux 会先编出
+            # vmlinux.o 再链接, modpost 因此走 vmlinux.symvers 分支,
+            # Module.symvers 才有内容.
+            echo "    编译 vmlinux (触发 vmlinux.o + modpost)..."
+            make -j"$(nproc)" $COMMON_FLAGS vmlinux
           fi
 
           echo "=== Module.symvers 状态 ==="
