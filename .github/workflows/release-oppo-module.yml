@@ -43,11 +43,11 @@ on:
         required: true
         type: boolean
         default: true
-      vermagic_suffix:
-        description: 'vermagic 后缀,必须与设备上已刷内核的 setlocalversion 后缀一致(留空则用内核树原生生成的版本号)'
-        required: false
+      device_kernelrelease:
+        description: '设备上 uname -r 的完整输出(如 6.1.157-android14-11-o-ga8ed1c96e9fd)。ko 的 vermagic 必须与之完全一致'
+        required: true
         type: string
-        default: 'android14-11-o-gca13bffobf09'
+        default: '6.1.157-android14-11-o-ga8ed1c96e9fd'
 
 permissions:
   contents: write
@@ -204,10 +204,27 @@ jobs:
           path: kernel_workspace/common/out/vmlinux.symvers
           key: oppo-vmlinux-symvers-${{ inputs.kernel_branch }}-v1
 
-      - name: 清理 ABI 文件并对齐 vermagic 后缀
+      - name: 清理 ABI 文件并对齐设备内核版本
         run: |
           set -euo pipefail
           cd kernel_workspace
+
+          # 设备 uname -r 形如 6.1.157-android14-11-o-ga8ed1c96e9fd。
+          # 官方开源树的 Makefile SUBLEVEL 可能与出货内核不同(本次就是
+          # 树里写 134、设备跑 157，OPPO 发布代码没同步版本号)，而
+          # vermagic 是整串字符串比对，所以 sublevel 和后缀都要对齐。
+          DEVICE_KREL="${{ inputs.device_kernelrelease }}"
+          KSUB="$(echo "$DEVICE_KREL" | cut -d'.' -f3 | cut -d'-' -f1)"
+          KSUFFIX="$(echo "$DEVICE_KREL" | cut -d'-' -f2-)"
+          echo ">>> 设备内核: $DEVICE_KREL (sublevel=$KSUB, suffix=$KSUFFIX)"
+
+          # 对齐 Makefile SUBLEVEL (只影响版本串, 不参与 symvers/CRC)
+          CUR_SUB="$(sed -n 's/^SUBLEVEL = //p' common/Makefile | tr -d ' ')"
+          if [ "$CUR_SUB" != "$KSUB" ]; then
+            sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $KSUB/" common/Makefile
+            echo ">>> Makefile SUBLEVEL: $CUR_SUB -> $KSUB"
+          fi
+
           rm -f common/android/abi_gki_protected_exports_* || true
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
@@ -215,26 +232,14 @@ jobs:
             # setlocalversion 在非干净 tag 状态且 LOCALVERSION 未设置时会追加 "+"，
             # 而 vermagic 带 "+" 会让设备 insmod 报 version magic mismatch 直接拒绝。
             sed -i 's|res="$res${scm:++}"|res="$res"|' "$f"
+            # 把 setlocalversion 输出整体替换为设备内核的后缀。
+            # 另注: 内核树经 zip 下载没有 .git, 但 setlocalversion 的 git rev-parse
+            # 会向上层目录找到 CI checkout 的 .git, 把无关的 commit hash 泄进版本号;
+            # 固定后缀替换同时规避了这个问题。
+            sed -i "\$s|echo \"\\\$res\"|echo \"-$KSUFFIX\"|" "$f"
           done
-
-          # 与设备内核的 vermagic 对齐: 设备上刷入的内核通常由厂商内核构建流程
-          # (如 cctv18 的 fastbuild) 把 setlocalversion 的输出整体替换为固定后缀,
-          # 见 scripts/setlocalversion 最后一行 echo。这里应用同样的替换,
-          # 否则 ko 的 vermagic(内核树原生 hash)与设备内核(固定后缀)不一致,
-          # insmod 会报 "version magic ... should be ..." 拒绝加载。
-          #
-          # 另注: 内核树经 zip 下载没有 .git, 但 setlocalversion 的 git rev-parse
-          # 会向上层目录找到 CI checkout 的 .git, 把无关的 commit hash 泄进版本号;
-          # 固定后缀替换同时规避了这个问题。
-          if [ -n "${{ inputs.vermagic_suffix }}" ]; then
-            for f in common/scripts/setlocalversion; do
-              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ inputs.vermagic_suffix }}\"|" "$f"
-            done
-            echo ">>> vermagic 后缀已固定为: -${{ inputs.vermagic_suffix }}"
-            tail -n 3 common/scripts/setlocalversion
-          else
-            echo ">>> 未指定 vermagic_suffix, 使用内核树原生版本号(含 CI hash, 仅供本地测试)"
-          fi
+          echo ">>> setlocalversion 输出已固定为: -$KSUFFIX"
+          tail -n 3 common/scripts/setlocalversion
 
       - name: 生成 .config 并 modules_prepare
         run: |
@@ -546,20 +551,20 @@ jobs:
           | 内核分支 | `${{ inputs.kernel_branch }}` |
           | 模块源码 | `${{ inputs.modules_repo }}` |
           | 模块分支 | `${{ inputs.modules_branch }}` |
-          | 内核版本 | `${{ needs.build-ko.outputs.kernelrelease }}` |
-          | vermagic 后缀 | `${{ inputs.vermagic_suffix }}`（须与设备上已刷内核一致） |
+          | 内核版本 | `${{ needs.build-ko.outputs.kernelrelease }}`（对齐设备 `uname -r`） |
+          | 设备内核 | `${{ inputs.device_kernelrelease }}` |
           | 工具链 | Clang 20 (Android r547379) |
           | nomount | `${{ github.sha }}` |
 
           #### vermagic 对齐说明
 
           ko 的 vermagic 必须与设备上**正在运行**的内核完全一致，否则
-          `insmod` 直接报 `version magic ... should be ...` 拒绝加载。
+          `insmod` 直接报 `Exec format error` 拒绝加载。
 
-          本包构建时按 `${{ inputs.vermagic_suffix }}` 固定了版本后缀，
-          与常见厂商内核构建流程（如 fastbuild 系列脚本）产出的内核一致。
-          若你的设备内核是其他后缀（或 OTA 后变化），请在触发本 workflow
-          时填写对应的 `vermagic_suffix` 重新构建。
+          本包构建时已按设备 `uname -r`（`${{ inputs.device_kernelrelease }}`）
+          对齐了 Makefile SUBLEVEL 与版本后缀。注意：开源树的 SUBLEVEL 可能
+          与出货内核不同步（本次树内为 134、设备为 157），已自动修正。
+          若设备 OTA 后内核版本变化，请填新的 `device_kernelrelease` 重新构建。
 
           #### 质量校验（构建时强制）
 
