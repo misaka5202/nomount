@@ -79,27 +79,59 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
 
+          # GitHub release 偶发 504, aria2 不会自己重试, 这里包一层
+          fetch() {
+            local url="$1" out="$2" tries=5 i=1
+            while [ "$i" -le "$tries" ]; do
+              rm -f "$out" "$out.aria2"
+              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试: $url"
+              i=$((i+1))
+              sleep 5
+            done
+            echo "::error::多次重试仍无法下载: $url"
+            return 1
+          }
+
           echo "正在下载 llvm-Clang20 工具链..."
           mkdir -p clang20
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
+          fetch "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip" clang.zip
           unzip -q clang.zip -d clang20
           rm -rf clang.zip
 
           echo "正在下载构建工具..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -o build-tools.zip
+          fetch "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip" build-tools.zip
           unzip -q build-tools.zip
           rm -rf build-tools.zip
 
           echo ">>> 工具链就绪"
+          ls clang20/bin/clang
+          ls build-tools/bin/ 2>/dev/null | head -n 5
 
       - name: 克隆 Find X7 内核树
         run: |
           set -euo pipefail
           cd kernel_workspace
           echo "正在克隆内核: ${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}"
-          aria2c -s16 -x16 -k1M \
-            "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" \
-            -o common.zip
+
+          fetch() {
+            local url="$1" out="$2" tries=5 i=1
+            while [ "$i" -le "$tries" ]; do
+              rm -f "$out" "$out.aria2"
+              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试"
+              i=$((i+1))
+              sleep 5
+            done
+            echo "::error::多次重试仍无法下载: $url"
+            return 1
+          }
+
+          fetch "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" common.zip
           unzip -q common.zip
           # 归档目录名会把 / 替换成 -
           SRC="$(find . -maxdepth 1 -type d -name 'android_kernel_*' | head -n1)"
@@ -112,9 +144,23 @@ jobs:
           set -euo pipefail
           cd kernel_workspace
           echo "正在克隆模块仓库: ${{ inputs.modules_repo }} @ ${{ inputs.modules_branch }}"
-          aria2c -s16 -x16 -k1M \
-            "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" \
-            -o modules.zip
+
+          fetch() {
+            local url="$1" out="$2" tries=5 i=1
+            while [ "$i" -le "$tries" ]; do
+              rm -f "$out" "$out.aria2"
+              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试"
+              i=$((i+1))
+              sleep 5
+            done
+            echo "::error::多次重试仍无法下载: $url"
+            return 1
+          }
+
+          fetch "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" modules.zip
           unzip -q modules.zip
           MODSRC="$(find . -maxdepth 1 -type d -name 'android_kernel_modules_*' | head -n1)"
           mv "$MODSRC" modules
