@@ -250,6 +250,35 @@ jobs:
           echo ">>> setlocalversion 输出已固定为: -$KSUFFIX"
           tail -n 3 common/scripts/setlocalversion
 
+      - name: 挂载 nomount 源码
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+
+          rm -rf fs/nomount && mkdir -p fs/nomount
+          cp -f "$GITHUB_WORKSPACE"/kernel/src/*.c \
+                "$GITHUB_WORKSPACE"/kernel/src/*.h \
+                "$GITHUB_WORKSPACE"/kernel/src/Makefile \
+                "$GITHUB_WORKSPACE"/kernel/src/Kconfig fs/nomount/
+
+          if ! grep -q 'fs/nomount/Kconfig' fs/Kconfig; then
+            awk '
+              /^endmenu/ { last = NR }
+              { lines[NR] = $0 }
+              END {
+                for (i = 1; i <= NR; i++) {
+                  if (i == last) print "source \"fs/nomount/Kconfig\""
+                  print lines[i]
+                }
+              }
+            ' fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+          fi
+
+          if ! grep -q 'nomount' fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          fi
+          ls -la fs/nomount
+
       - name: 生成 .config 并 modules_prepare
         run: |
           set -euo pipefail
@@ -286,9 +315,9 @@ jobs:
 
           # 官方树自带的 resolve_btfids/libbpf 在 Clang20 下必然编译失败，
           # 且 nomount 不需要 BTF，直接关掉（BTF 不参与 genksyms CRC，可安全关闭）。
-          # NOMOUNT 必须在这里（olddefconfig 之前）写入，这样 include/config/auto.conf
-          # 才会带上它。如果在 modules_prepare 之后才改 .config，auto.conf 是旧的，
-          # obj-$(CONFIG_NOMOUNT) 展开为空，make 会认为无事可做，直接跳过编译。
+          # NOMOUNT 必须在这里（olddefconfig 之前）写入 —— 且 fs/nomount/Kconfig
+          # 必须在"挂载 nomount 源码"步骤中先行挂载，否则 Kconfig 不认识这个符号，
+          # olddefconfig 会把 unknown CONFIG_NOMOUNT 静默丢弃，auto.conf 里就没有它。
           ./scripts/config --file out/.config -d DEBUG_INFO_BTF      || true
           ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES || true
           ./scripts/config --file out/.config -d DEBUG_INFO          || true
@@ -306,38 +335,33 @@ jobs:
           echo "=== 抽查关键配置是否与设备一致 ==="
           grep -E '^CONFIG_(ARCH_MEDIATEK|ABI_MONITOR|OPLUS_FEATURE_SCHED_ASSIST|MTK_|MODVERSIONS)=' out/include/config/auto.conf | head -n 15 || true
 
+          # 硬闸门: 校验真正影响 common/ 树 ABI 的配置项。
+          #
+          # 注意: mgk_64_k61_defconfig 里的 CONFIG_MTK_*/CONFIG_ARCH_MEDIATEK 等
+          # 符号在 common/ 树的 Kconfig 中并不存在(它们属于独立的
+          # kernel_device_modules-6.1 源码树, 由 kleaf 作为 device_modules 编入),
+          # 因此这些行会被 olddefconfig 正常丢弃, 且不影响 common/ 的 struct 布局。
+          # 真正决定 common/ 内核 ABI/CRC 的是下面这些, 必须与出货内核一致。
+          MISS_CFG=0
+          for s in CONFIG_MODVERSIONS CONFIG_CFI_CLANG CONFIG_SHADOW_CALL_STACK CONFIG_ARM64; do
+            if grep -q "^${s}=" out/include/config/auto.conf; then
+              echo "  OK    $(grep "^${s}=" out/include/config/auto.conf)"
+            else
+              echo "  MISS  $s"
+              case "$s" in
+                CONFIG_ARM64) MISS_CFG=1 ;;   # 缺失说明配置根本没生效
+                *) echo "        (该项在出货内核里可能未启用, 记录但不阻断)" ;;
+              esac
+            fi
+          done
+          [ "$MISS_CFG" -eq 0 ] || {
+            echo "::error::基础架构配置异常, .config 生成失败"
+            exit 1
+          }
+
           KREL="$(cat out/include/config/kernel.release 2>/dev/null || make -s O=out ARCH=arm64 LLVM=1 kernelrelease)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
           echo "内核版本: $KREL"
-
-      - name: 挂载 nomount 源码
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/common
-
-          rm -rf fs/nomount && mkdir -p fs/nomount
-          cp -f "$GITHUB_WORKSPACE"/kernel/src/*.c \
-                "$GITHUB_WORKSPACE"/kernel/src/*.h \
-                "$GITHUB_WORKSPACE"/kernel/src/Makefile \
-                "$GITHUB_WORKSPACE"/kernel/src/Kconfig fs/nomount/
-
-          if ! grep -q 'fs/nomount/Kconfig' fs/Kconfig; then
-            awk '
-              /^endmenu/ { last = NR }
-              { lines[NR] = $0 }
-              END {
-                for (i = 1; i <= NR; i++) {
-                  if (i == last) print "source \"fs/nomount/Kconfig\""
-                  print lines[i]
-                }
-              }
-            ' fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
-          fi
-
-          if ! grep -q 'nomount' fs/Makefile; then
-            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
-          fi
-          ls -la fs/nomount
 
       - name: 编译 nomount.ko
         run: |
