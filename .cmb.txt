@@ -1,0 +1,29 @@
+﻿fix: stop disabling BTF_MODULES, it changes struct module's size
+
+This is the root cause of every CRC mismatch, and it was self-inflicted.
+
+CONFIG_DEBUG_INFO_BTF_MODULES gates two members inside struct module:
+
+    #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+            unsigned int btf_data_size;
+            void *btf_data;
+    #endif
+
+The device config has it =y. Earlier, to work around a Clang 20 build
+failure in resolve_btfids, BTF was switched off wholesale with
+scripts/config -d DEBUG_INFO_BTF_MODULES. That silently shrank struct
+module, which is measurable: every vendor ko on the device has a
+1088-byte .gnu.linkonce.this_module section, while ours came out 1024.
+
+Keeping it disabled guaranteed module_layout could never match, no
+matter how many field patches were layered on top.
+
+Restore the device's BTF settings untouched, and fix the toolchain
+problem where it actually lives: patch the bundled libbpf's qualifier
+mismatch (next_path = strchr(...)) with an explicit cast, so the
+resolve_btfids host tool compiles. That file is a build-time helper and
+never reaches the kernel, so the cast cannot affect ABI.
+
+GKI's android14-6.1 KMI does freeze module_layout across vendor kernels;
+matching it requires compiling with the shipped config, which is what
+this restores.

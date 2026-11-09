@@ -286,6 +286,12 @@ jobs:
           grep -n -B1 -A2 'its_num_pages' include/linux/module.h || {
             echo "::error::字段注入失败"; exit 1; }
 
+          # CONFIG_DEBUG_INFO_BTF_MODULES 必须保持 =y（它决定 struct module
+          # 是否包含 btf_data_size / btf_data 两个字段），因此 resolve_btfids
+          # 这个 host tool 必须能编译通过。Clang20 会把 libbpf 里一处
+          # const 限定符不匹配提升为 error，这里打补丁修掉。
+          python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
+
 
 
       - name: 挂载 nomount 源码
@@ -361,20 +367,34 @@ jobs:
           # 且 CONFIG_MODULE_SIG_ALL 未开启（模块不签名），对齐为不指定密钥。
           sed -i -E 's|^CONFIG_MODULE_SIG_KEY=.*|# CONFIG_MODULE_SIG_KEY is not set|' out/.config
 
-          # BTF 相关：不参与 genksyms CRC，关闭不影响 ABI。
+          # 【关键】不要关闭 CONFIG_DEBUG_INFO_BTF_MODULES！
+          #
+          # 它会改变 struct module 的字段组成:
+          #   #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+          #           unsigned int btf_data_size;
+          #           void *btf_data;
+          #   #endif
+          # 设备 config 里该项为 y，关掉它 struct module 就少 16 字节，
+          # module_layout CRC 必然对不上（实测 ko 的 __this_module 段
+          # 只有 1024 字节，而设备上所有厂商 ko 都是 1088）。
+          #
+          # 之前为了绕开 resolve_btfids 的 Clang20 编译错误而关掉 BTF，
+          # 是本轮排查里最根本的方向性错误 —— 等于主动破坏了 ABI。
+          #
+          # 正确做法: 保留设备原样的 BTF 配置，改用下面的方式让
+          # resolve_btfids 能编译通过（给 host tools 放宽 -Werror）。
+          #
           # NOMOUNT 必须在此写入；fs/nomount/Kconfig 已在前一步挂载。
           # MITIGATION_ITS 由 scripts/patch_module_layout.py 补了 Kconfig 条目，
-          # 这里显式打开，使 module.h 里的 #ifdef 成立（设备内核同样启用）。
-          ./scripts/config --file out/.config \
-            -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -d DEBUG_INFO -d PAHOLE \
-            -m NOMOUNT -e MITIGATION_ITS
+          # 这里显式打开，使 module.h 里的 #ifdef 成立（设备 kheaders 中该字段存在）。
+          ./scripts/config --file out/.config -m NOMOUNT -e MITIGATION_ITS
 
           echo "=== 配置与设备一致性核对 ==="
           MISS=0
           for k in CONFIG_MODULES CONFIG_SYSFS CONFIG_FTRACE CONFIG_MODULE_UNLOAD \
                    CONFIG_KALLSYMS_ALL CONFIG_CFI_CLANG CONFIG_TRACEPOINTS \
                    CONFIG_JUMP_LABEL CONFIG_MODVERSIONS CONFIG_ARM64 \
-                   CONFIG_MITIGATION_ITS; do
+                   CONFIG_MITIGATION_ITS CONFIG_DEBUG_INFO_BTF_MODULES; do
             if grep -q "^${k}=y" out/.config; then
               echo "  OK    $k=y"
             else
