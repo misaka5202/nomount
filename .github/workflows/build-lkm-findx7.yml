@@ -67,6 +67,15 @@ jobs:
           git fetch --all --tags --quiet || true
           git checkout "${{ inputs.nomount_ref }}"
 
+      - name: 缓存 Clang 工具链
+        id: toolchain-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/clang20
+            kernel_workspace/build-tools
+          key: findx7-toolchain-clang20-r547379-v1
+
       - name: 安装构建依赖 + 下载 Clang 工具链
         run: |
           set -euo pipefail
@@ -79,106 +88,135 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
 
-          # GitHub release 偶发 504, aria2 不会自己重试, 这里包一层
+          # 缓存命中就直接跳过下载
+          if [ -x clang20/bin/clang ] && [ -d build-tools/bin ]; then
+            echo ">>> 工具链缓存命中, 跳过下载"
+            ./clang20/bin/clang --version | head -n1
+            exit 0
+          fi
+
+          # GitHub release 偶发 504/超时. 多镜像 + 长重试 + 断点续传.
+          TCL_BASE="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379"
+
           fetch() {
-            local url="$1" out="$2" tries=5 i=1
+            local name="$1" out="$2" tries=8 i=1
+            local -a urls=(
+              "$TCL_BASE/$name"
+              "https://ghproxy.net/$TCL_BASE/$name"
+              "https://gh-proxy.com/$TCL_BASE/$name"
+            )
             while [ "$i" -le "$tries" ]; do
-              rm -f "$out" "$out.aria2"
-              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
+              local url="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  尝试第 $i/$tries 次: $url"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$url" -o "$out"; then
                 return 0
               fi
-              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试: $url"
+              echo "::warning::$name 下载失败 (第 $i/$tries 次)"
               i=$((i+1))
-              sleep 5
+              sleep $((i * 3))
             done
-            echo "::error::多次重试仍无法下载: $url"
+            echo "::error::多次重试仍无法下载: $name"
             return 1
           }
 
           echo "正在下载 llvm-Clang20 工具链..."
           mkdir -p clang20
-          fetch "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip" clang.zip
-          unzip -q clang.zip -d clang20
-          rm -rf clang.zip
+          fetch "clang-r547379.zip" clang.zip
+          unzip -q -o clang.zip -d clang20
+          rm -f clang.zip
 
           echo "正在下载构建工具..."
-          fetch "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip" build-tools.zip
-          unzip -q build-tools.zip
-          rm -rf build-tools.zip
+          fetch "build-tools.zip" build-tools.zip
+          unzip -q -o build-tools.zip
+          rm -f build-tools.zip
 
           echo ">>> 工具链就绪"
-          ls clang20/bin/clang
+          ./clang20/bin/clang --version | head -n1
           ls build-tools/bin/ 2>/dev/null | head -n 5
 
-      - name: 克隆 Find X7 内核树
+      - name: 缓存内核源码与 vendor
+        id: kernel-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/vendor
+          key: findx7-kernel-${{ inputs.kernel_repo }}-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v1
+
+      - name: 准备内核源码与 vendor
         run: |
           set -euo pipefail
           cd kernel_workspace
-          echo "正在克隆内核: ${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}"
 
+          # 多镜像重试下载器
           fetch() {
-            local url="$1" out="$2" tries=5 i=1
+            local name="$1" url="$2" out="$3" tries=8 i=1
+            local -a urls=("$url" "https://ghproxy.net/$url" "https://gh-proxy.com/$url")
             while [ "$i" -le "$tries" ]; do
-              rm -f "$out" "$out.aria2"
-              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
+              local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  尝试第 $i/$tries 次: $u"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$u" -o "$out"; then
                 return 0
               fi
-              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试"
+              echo "::warning::$name 下载失败 (第 $i/$tries 次)"
               i=$((i+1))
-              sleep 5
+              sleep $((i * 3))
             done
-            echo "::error::多次重试仍无法下载: $url"
+            echo "::error::多次重试仍无法下载: $name"
             return 1
           }
 
-          fetch "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" common.zip
-          unzip -q common.zip
-          # 归档目录名会把 / 替换成 -
-          SRC="$(find . -maxdepth 1 -type d -name 'android_kernel_*' | head -n1)"
-          mv "$SRC" common
-          rm -f common.zip
-          echo "内核树: $(ls -d common)"
+          if [ -d common/fs ] && [ -d vendor/oplus/kernel ]; then
+            echo ">>> 内核源码与 vendor 缓存命中, 跳过下载"
+          else
+            rm -rf common vendor
 
-      - name: 克隆 OPPO 内核模块仓库并链接 vendor
-        run: |
-          set -euo pipefail
-          cd kernel_workspace
-          echo "正在克隆模块仓库: ${{ inputs.modules_repo }} @ ${{ inputs.modules_branch }}"
+            echo ">>> 下载内核树: ${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}"
+            fetch "kernel" \
+              "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" \
+              common.zip
+            unzip -q -o common.zip
+            SRC="$(find . -maxdepth 1 -type d -name 'android_kernel_*' | head -n1)"
+            mv "$SRC" common
+            rm -f common.zip
 
-          fetch() {
-            local url="$1" out="$2" tries=5 i=1
-            while [ "$i" -le "$tries" ]; do
-              rm -f "$out" "$out.aria2"
-              if aria2c -s16 -x16 -k1M --max-tries=3 --retry-wait=5 --timeout=60 "$url" -o "$out"; then
-                return 0
-              fi
-              echo "::warning::下载失败 (第 $i/$tries 次), 5 秒后重试"
-              i=$((i+1))
-              sleep 5
-            done
-            echo "::error::多次重试仍无法下载: $url"
-            return 1
-          }
+            echo ">>> 下载模块仓库: ${{ inputs.modules_repo }} @ ${{ inputs.modules_branch }}"
+            fetch "modules" \
+              "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" \
+              modules.zip
+            unzip -q -o modules.zip
+            MODSRC="$(find . -maxdepth 1 -type d -name 'android_kernel_modules_*' | head -n1)"
+            mv "$MODSRC" modules
+            rm -f modules.zip
 
-          fetch "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" modules.zip
-          unzip -q modules.zip
-          MODSRC="$(find . -maxdepth 1 -type d -name 'android_kernel_modules_*' | head -n1)"
-          mv "$MODSRC" modules
-          rm -f modules.zip
+            # 关键: 内核树里 drivers/soc/oplus/* 指向 ../../../../vendor/oplus/kernel/...
+            # 从 common/drivers/soc/oplus 往上 4 级 = kernel_workspace/, 所以 vendor 放这里
+            cp -r modules/vendor vendor
+            rm -rf modules
+          fi
 
-          # 关键: 内核树里的 drivers/soc/oplus/* 是指向 ../../../../vendor/oplus/kernel/... 的符号链接
-          # 从 common/drivers/soc/oplus 往上 4 级 = kernel_workspace/，所以 vendor 要放在 kernel_workspace/vendor
-          cp -r modules/vendor vendor
-          echo ">>> vendor 已就位: $(du -sh vendor | cut -f1)"
+          echo ">>> 内核树: $(ls -d common 2>/dev/null)"
+          echo ">>> vendor: $(du -sh vendor 2>/dev/null | cut -f1)"
 
           # 验证符号链接可解析
           for l in common/drivers/soc/oplus/oplus_resctrl common/drivers/soc/oplus/storage; do
             if [ -e "$l" ] && [ -d "$l" ]; then
               echo "  OK  $l"
             else
-              echo "  WARN $l 未被解析 (该符号链接可能不存在或目标缺失)"
+              echo "  WARN $l 未被解析"
             fi
           done
+
+      - name: 缓存内核符号表
+        id: symvers-cache
+        uses: actions/cache@v5
+        with:
+          path: kernel_workspace/common/out/vmlinux.symvers
+          key: findx7-vmlinux-symvers-${{ inputs.kernel_branch }}-v1
 
       - name: 去掉 ABI 保护文件与 dirty 后缀
         run: |
@@ -317,13 +355,15 @@ jobs:
           #
           # 正解: 先编出 vmlinux.o (KBUILD_VMLINUX_OBJS 的全部 build-in 对象),
           # 这样 modpost 走 vmlinux.symvers 分支, Module.symvers 才会生成。
-          echo ">>> 生成 out/Module.symvers (需要 vmlinux 的 modpost 阶段)..."
-          if [ ! -f out/Module.symvers ]; then
-            # 注意: vmlinux.o 在 O= 外部构建时不是合法顶层 target
+          echo ">>> 准备内核符号表 (vmlinux 的 modpost 阶段)..."
+          if [ -s out/vmlinux.symvers ]; then
+            echo "    符号表已存在 (缓存命中), 跳过 vmlinux 编译"
+            echo "    条目数: $(wc -l < out/vmlinux.symvers)"
+          elif [ ! -f out/Module.symvers ]; then
+            # vmlinux.o 在 O= 外部构建时不是合法顶层 target
             # ("No rule to make target 'vmlinux.o'"), 但 vmlinux 会先编出
-            # vmlinux.o 再链接, modpost 因此走 vmlinux.symvers 分支,
-            # vmlinux.symvers 才有内容.
-            echo "    编译 vmlinux (触发 vmlinux.o + modpost)..."
+            # vmlinux.o 再链接, modpost 因此走 vmlinux.symvers 分支。
+            echo "    编译 vmlinux (触发 vmlinux.o + modpost), 约需 15-20 分钟..."
             make -j"$(nproc)" $COMMON_FLAGS vmlinux || true
           fi
 
