@@ -1,0 +1,15 @@
+﻿ci: exclude generated/ when overlaying kheaders, clean tree beforehand
+
+The overlay pulled kheaders' include/generated/* (autoconf.h,
+utsrelease.h, compile.h, ...) into the source tree. Those are outputs of
+a previous build, and their presence makes kbuild abort with
+
+  *** The source tree is not clean, please run make ARCH=arm64 mrproper
+
+which is why this step failed as soon as the header overlay was enabled.
+
+Skip generated/ and config/ during the copy (they must be regenerated
+from the current .config), and drop stale build products before the
+overlay runs. Also fix the destination paths: the step now cds into
+common/ so include/ and arch/arm64/include/ are addressed relative to it
+rather than through a common/ prefix.
