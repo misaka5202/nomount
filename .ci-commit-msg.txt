@@ -1,22 +1,22 @@
-fix(ci): move config overlay to scripts/, repair broken workflow YAML
+ci: overlay the device's own kheaders to fix residual struct layout drift
 
-The previous commit inlined a Python heredoc into the workflow's run
-block. Its lines started at column 1, which is outside the YAML block
-scalar, so the whole workflow failed to parse:
+With the device .config fully applied (verified MODULES, MODVERSIONS,
+FTRACE, KALLSYMS_ALL, SYSFS, CFI_CLANG all =y), module_layout still
+disagrees:
 
-    yaml.scanner.ScannerError: while scanning a simple key
-    .github/workflows/release-oppo-module.yml, line 358
+    device: 0xea759d7f
+    ours:   0xa26bedb1   (identical to the value before any config work)
 
-GitHub then reported "Workflow does not have 'workflow_dispatch'
-trigger" because the file no longer parsed at all. Move the overlay
-logic into scripts/overlay_config.py and call it from the run block.
+That rules out CONFIG-driven layout changes and points at the type
+definitions themselves: the open-source tree is 6.1.134, the device runs
+6.1.157, and stable backports in between touched struct module and the
+nested types it embeds.
 
-Also regenerate device_full.config properly. The earlier copy was
-captured through PowerShell's default UTF-16 encoding, which doubled its
-size to 540106 bytes and injected U+FFFD replacement characters, so
-every CONFIG_ line failed to match and the overlay silently parsed 0
-device symbols. The file is now 260934 bytes of pure ASCII, and the
-overlay reports 7395 device symbols.
+CONFIG_IKHEADERS is enabled on this device, so its own include/ tree is
+readable from /sys/kernel/kheaders.tar.xz. Ship it as
+device_kheaders.tar.xz and overlay it onto the kernel tree before
+building. The step still accepts device_headers_url for rotating it
+without a commit, and warns rather than failing when neither is present.
 
-Verified locally: MODULES, MODVERSIONS, MODULE_UNLOAD, FTRACE,
-KALLSYMS_ALL, SYSFS, ARM64 and CFI_CLANG all keep the device's values.
+Overlay only replaces files the device also has; tree-only headers stay
+untouched so the build does not break on missing internals.

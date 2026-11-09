@@ -253,32 +253,57 @@ jobs:
           tail -n 3 common/scripts/setlocalversion
 
       - name: 用运行内核的精确头文件替换开源树头文件
-        if: inputs.device_headers_url != ''
         run: |
           set -euo pipefail
           cd kernel_workspace
 
-          # /sys/kernel/kheaders.tar.xz 是运行内核编译期打包的 CONFIG_IKHEADERS，
-          # 内含该内核实际使用的 include/ 全量头文件。用它替换 open-source 树的
-          # include/ 后，struct module 等结构的字段布局、CONFIG 依赖都自动与设备一致,
-          # module_layout CRC 也会自然算出正确值 —— 不需要伪造 CRC。
-          echo ">>> 下载设备头文件: ${{ inputs.device_headers_url }}"
-          curl -fsSL --retry 5 --retry-delay 5 -o kheaders.tar.xz "${{ inputs.device_headers_url }}"
+          # 用运行内核自己的 include/ 覆盖开源树，这是让 struct module 等
+          # 结构的字段布局与设备一致的关键一步。
+          #
+          # 为什么必须这么做:
+          #   即使 .config 完全对齐(实测 MODULES/MODVERSIONS/FTRACE/
+          #   KALLSYMS_ALL/SYSFS 都是 y)，module_layout CRC 仍是
+          #     设备 0xea759d7f  vs  我们 0xa26bedb1
+          #   说明差异不在配置开关，而在类型定义本身。开源树是 6.1.134，
+          #   设备是 6.1.157，中间的 stable 回移改过 struct module 及其
+          #   引用的嵌套类型。
+          #
+          # 头文件来源优先级:
+          #   1) 输入参数 device_headers_url（可用真实 URL 覆盖）
+          #   2) 仓库内的 device_kheaders.tar.xz（从设备
+          #      /sys/kernel/kheaders.tar.xz 导出，CONFIG_IKHEADERS 提供）
+          KH_URL="${{ inputs.device_headers_url }}"
+          if [ -n "$KH_URL" ]; then
+            echo ">>> 从 URL 下载设备头文件: $KH_URL"
+            curl -fsSL --retry 5 --retry-delay 5 -o kheaders.tar.xz "$KH_URL"
+          elif [ -f "$GITHUB_WORKSPACE/device_kheaders.tar.xz" ]; then
+            echo ">>> 使用仓库内的 device_kheaders.tar.xz"
+            cp -f "$GITHUB_WORKSPACE/device_kheaders.tar.xz" kheaders.tar.xz
+          else
+            echo "::warning::没有设备头文件，继续使用开源树的 include/"
+            exit 0
+          fi
+
           ls -lh kheaders.tar.xz
-          mkdir -p devheaders
+          rm -rf devheaders && mkdir -p devheaders
           tar -xJf kheaders.tar.xz -C devheaders
+          echo "--- 包结构 ---"
           ls devheaders
 
-          # 定位头文件根（不同内核对目录层级略有差异）
-          HDR_ROOT="$(dirname "$(find devheaders -path '*/linux/module.h' | head -n1)")"
-          HDR_ROOT="$(dirname "$HDR_ROOT")"   # .../include
-          [ -d "$HDR_ROOT" ] || { echo "::error::无法定位 include 根"; find devheaders -maxdepth 3 -type d | head -n 30; exit 1; }
-          echo ">>> 设备头文件根: $HDR_ROOT"
+          # 覆盖 include/（同名文件以设备为准，树独有的保留，避免破坏构建）
+          if [ -d devheaders/include ]; then
+            cp -a devheaders/include/. common/include/
+            echo "  已覆盖 common/include/"
+          fi
+          # arch/arm64/include 同样覆盖（asm/ 下也有影响 ABI 的定义）
+          if [ -d devheaders/arch/arm64/include ]; then
+            cp -a devheaders/arch/arm64/include/. common/arch/arm64/include/
+            echo "  已覆盖 common/arch/arm64/include/"
+          fi
 
-          # 覆盖同名头文件（不删除开源树独有文件，避免破坏构建）
-          cp -a "$HDR_ROOT"/. common/include/
-          echo ">>> 已覆盖 include/，抽查 struct module 所在头文件"
+          echo "=== 覆盖后抽查 ==="
           ls -l common/include/linux/module.h
+          grep -c 'CONFIG_MITIGATION_ITS' common/include/linux/module.h || true
 
       - name: 挂载 nomount 源码
         run: |
