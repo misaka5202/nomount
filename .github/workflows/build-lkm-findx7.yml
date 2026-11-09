@@ -203,15 +203,32 @@ jobs:
           cd kernel_workspace/common
 
           # 浅合并 gki_defconfig 生成 .config
+          # WERROR=0: 官方树自带的 host tools (resolve_btfids/libbpf) 在 Clang20 下有
+          # -Werror 级别的告警, 不关掉的话 modules_prepare 直接失败
           make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0 \
             gki_defconfig
 
           # modules_prepare 只准备 headers/scripts，不编整个内核，速度快很多
           echo ">>> modules_prepare..."
-          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out \
-            KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules_prepare
+          COMMON_FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          PREPARE_OK=0
+          if make -j"$(nproc)" $COMMON_FLAGS modules_prepare; then
+            PREPARE_OK=1
+          fi
+
+          if [ "$PREPARE_OK" -eq 0 ]; then
+            echo "::warning::modules_prepare 首次失败, 降级: 关闭 BTF 与 resolve_btfids 后重试"
+            ./scripts/config --file out/.config -d DEBUG_INFO_BTF
+            ./scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES
+            ./scripts/config --file out/.config -d PAHOLE
+            make -j"$(nproc)" $COMMON_FLAGS olddefconfig
+            make -j"$(nproc)" $COMMON_FLAGS modules_prepare
+          fi
 
           echo ">>> modules_prepare 完成"
           # 记录内核版本，用于 ko 命名
@@ -255,6 +272,23 @@ jobs:
           ls -la fs/nomount
           tail -n 3 fs/Makefile
 
+      - name: 启用 CONFIG_NOMOUNT=m
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+
+          # 把 NOMOUNT 显式写进 .config 再 olddefconfig, 比命令行带 CONFIG_ 更可靠
+          if grep -q '^CONFIG_NOMOUNT' out/.config; then
+            sed -i -E 's/^#? ?CONFIG_NOMOUNT[= ].*/CONFIG_NOMOUNT=m/' out/.config || true
+          else
+            echo 'CONFIG_NOMOUNT=m' >> out/.config
+          fi
+          ./scripts/config --file out/.config -m NOMOUNT
+
+          ./scripts/config --file out/.config -d LOCALVERSION_AUTO || true
+          echo "=== 确认配置 ==="
+          grep -E '^CONFIG_NOMOUNT|^CONFIG_MODULES|^CONFIG_MODULE_SIG' out/.config
+
       - name: 编译 nomount.ko
         run: |
           set -euo pipefail
@@ -265,15 +299,18 @@ jobs:
           cd kernel_workspace/common
 
           echo ">>> 编译 nomount.ko (=m) ..."
-          CONFIG_NOMOUNT=m make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out \
-            KCFLAGS+=-O2 KCFLAGS+=-Wno-error M="$PWD/fs/nomount" modules
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0 \
+            M="$PWD/fs/nomount" modules
 
           echo ">>> 查找产物..."
           find . -name 'nomount.ko' -o -name 'nomount.mod' | head -n 20
 
           if [ ! -f fs/nomount/nomount.ko ]; then
             echo "::error::未找到 nomount.ko"
+            echo "=== 最近的编译错误 ==="
+            true
             exit 1
           fi
 
