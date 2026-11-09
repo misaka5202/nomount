@@ -305,27 +305,36 @@ jobs:
             CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
-          # 关键: modules_prepare 不生成 out/Module.symvers。
-          # 没有它 modpost 就没法解析符号版本, 生成的 ko 在设备上会报
-          # "disagrees about version of symbol" 或直接加载失败。
-          # vmlinux 的符号表来自 KBUILD_VMLINUX_OBJS 的 Module.symvers,
-          # 所以这里先编出 vmlinux 的 modpost 阶段 (build-in 编译, 不产出镜像)
-          echo ">>> 生成 out/Module.symvers (编译 vmlinux 的 modpost 阶段)..."
+          # 关键: modules_prepare 既没有 vmlinux.o 也没有子孙模块, 所以
+          # scripts/Makefile.modpost 只会产出 modules-only.symvers,
+          # out/Module.symvers 根本不会出现。而没有它, modpost 无法写入
+          # 符号 CRC, 设备上加载会报 "no version for symbol ..." 直接失败,
+          # 或者偏移错位直接 panic。
+          #
+          # 正解: 先编出 vmlinux.o (KBUILD_VMLINUX_OBJS 的全部 build-in 对象),
+          # 这样 modpost 走 vmlinux.symvers 分支, Module.symvers 才会生成。
+          echo ">>> 生成 out/Module.symvers (需要 vmlinux.o)..."
           if [ ! -f out/Module.symvers ]; then
-            make -j"$(nproc)" $COMMON_FLAGS vmlinux.mod 2>/dev/null || \
-            make -j"$(nproc)" $COMMON_FLAGS modules 2>/dev/null || true
-          fi
-
-          if [ ! -f out/Module.symvers ]; then
-            echo "::warning::out/Module.symvers 仍未生成, 尝试完整 Image 构建以产生符号表"
-            make -j"$(nproc)" $COMMON_FLAGS Image || true
+            if [ ! -f out/vmlinux.o ]; then
+              echo "    编译 vmlinux.o (build-in 对象, 不含驱动镜像)..."
+              make -j"$(nproc)" $COMMON_FLAGS vmlinux.o
+            fi
+            echo "    触发 modpost 生成 Module.symvers..."
+            make -j"$(nproc)" $COMMON_FLAGS modules
           fi
 
           echo "=== Module.symvers 状态 ==="
-          ls -lh out/Module.symvers 2>/dev/null || echo "缺失"
-          wc -l out/Module.symvers 2>/dev/null || true
+          if [ -f out/Module.symvers ]; then
+            ls -lh out/Module.symvers
+            echo "    条目数: $(wc -l < out/Module.symvers)"
+          else
+            echo "::error::out/Module.symvers 未能生成, 这样的 ko 在设备上无法正确加载"
+            ls -lh out/*.symvers 2>/dev/null || true
+            exit 1
+          fi
 
           echo ">>> 编译 nomount.ko ..."
+          echo "BUILD_CLANG=$(clang --version | head -n1)" >> "$GITHUB_ENV"
           make -j"$(nproc)" $COMMON_FLAGS M="$PWD/fs/nomount" modules
 
           echo ">>> 查找产物..."
@@ -413,7 +422,7 @@ jobs:
           nomount  : $(git rev-parse --short HEAD) ($(git log -1 --format=%s))
           KernelRel: ${KERNELRELEASE}
           构建时间 : $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
-          Clang    : $(clang --version 2>/dev/null | head -n1 || echo n/a)
+          Clang    : ${BUILD_CLANG}
           
           用法:
             adb push ${{ inputs.ko_name }}.ko /data/local/tmp/
