@@ -398,7 +398,8 @@ jobs:
           set -euo pipefail
 
           # artifact 现在是打包上传, 先解开找到 nomount.ko
-          KO_SRC="$(find ./ko -name 'nomount.ko' | head -n1)"
+          # 注意: find 可能返回相对路径, 后面会 cd, 必须先转成绝对路径
+          KO_SRC="$(find "$(pwd)/ko" -name 'nomount.ko' | head -n1)"
           [ -n "$KO_SRC" ] || { echo "::error::artifact 里没有 nomount.ko"; ls -R ./ko; exit 1; }
           echo "ko: $KO_SRC ($(stat -c%s "$KO_SRC") bytes)"
 
