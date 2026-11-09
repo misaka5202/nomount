@@ -310,6 +310,19 @@ jobs:
             echo "::error::merge_config 失败"; exit 1; }
           echo ">>> 合成配置行数: $(wc -l < arch/arm64/configs/mgk_64_k61_merged_defconfig)"
 
+          # mgk_64_k61_defconfig 里有一行
+          #   CONFIG_MODULE_SIG_KEY="$(DEVICE_MODULES_REL_DIR)/certs/mtk_signing_key.pem"
+          # $(DEVICE_MODULES_REL_DIR) 由 kleaf 的 build.config 以 shell 变量注入，
+          # 纯 kbuild 环境下不会展开，路径退化成 /certs/mtk_signing_key.pem，
+          # 导致 make 报 "No rule to make target '/certs/mtk_signing_key.pem'"。
+          # 出货内核的 CONFIG_MODULE_SIG_ALL 本就未开启（mgk defconfig 中注释掉），
+          # 模块不签名，因此这里改为不指定签名密钥，语义与出货一致。
+          sed -i -E 's|^CONFIG_MODULE_SIG_KEY=.*|# CONFIG_MODULE_SIG_KEY is not set|' \
+            arch/arm64/configs/mgk_64_k61_merged_defconfig
+          sed -i -E 's|^CONFIG_MODULE_SIG_ALL=.*|# CONFIG_MODULE_SIG_ALL is not set|' \
+            arch/arm64/configs/mgk_64_k61_merged_defconfig
+          grep -n 'MODULE_SIG' arch/arm64/configs/mgk_64_k61_merged_defconfig || true
+
           # defconfig 目标以合成文件为基底生成 out/.config
           make -j"$(nproc)" $FLAGS mgk_64_k61_merged_defconfig
 
