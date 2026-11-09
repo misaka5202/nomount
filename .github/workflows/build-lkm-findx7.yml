@@ -455,36 +455,43 @@ jobs:
           llvm-nm -u "$KO" 2>/dev/null | grep -E 'd_lookup|generic_file_mmap|iget5_locked|vfs_getattr|d_splice_alias|d_add|register_key_type' || true
 
           echo "=== 校验 ko 内是否写入了符号 CRC ==="
-          # 注意: 6.1 内核不生成 __crc_<sym> 符号 (那是老内核的做法)。
-          # 现在的 CRC 存在 .symversions 段里 (modpost.c: mod_set_crcs 从
-          # #SYMVER <name> <crc> 解析, 最终落到 __versions 段)。
-          # 所以查 "Symbol table" 里的 __crc_ 永远是 0, 要用 __versions / .symversions。
-          CRC_COUNT=$(llvm-nm "$KO" 2>/dev/null | grep -c '__crc_' || true)
-          VERSIONS_SECTION=$(llvm-objdump -h "$KO" 2>/dev/null | grep -c 'symversions\|__versions' || true)
-          VERSIONS_SYMS=$(llvm-nm "$KO" 2>/dev/null | grep -c '__versions\|__kcrctab' || true)
-
-          echo "  __crc_ 符号数          : $CRC_COUNT  (6.1 内核预期为 0)"
-          echo "  .symversions/__versions段: $VERSIONS_SECTION"
-          echo "  __versions 相关符号    : $VERSIONS_SYMS"
-
-          # 真正的判定: 段内是否真的有 CRC 记录. 用 strings 数 SYMVER 行
-          SYMVER_IN_MOD=$([ -f fs/nomount/nomount.mod ] && grep -c '^0x' fs/nomount/nomount.mod 2>/dev/null || echo 0)
-          echo "  nomount.mod 内 CRC 行数 : $SYMVER_IN_MOD"
-
-          if [ "$VERSIONS_SECTION" -gt 0 ] || [ "$VERSIONS_SYMS" -gt 0 ] || [ "$SYMVER_IN_MOD" -gt 0 ]; then
-            echo "  OK: ko 已带符号版本信息, 可在目标内核上做 modversions 校验"
-            llvm-objdump -h "$KO" 2>/dev/null | grep -E 'symversions|__versions' || true
-            [ -f fs/nomount/nomount.mod ] && echo "  --- nomount.mod 前 5 行 ---" && head -n 5 fs/nomount/nomount.mod || true
+          # 6.1 内核不生成 __crc_<sym> 符号 (那是老内核做法)。
+          # CRC 实际写入 ko 的 __versions 段 (modpost.c: mod_set_crcs 从
+          # #SYMVER <name> <crc> 解析). 判定要看该段是否存在且非空。
+          VERS_LINE=$(llvm-objdump -h "$KO" 2>/dev/null | grep '__versions' | head -n1 || true)
+          VERS_SIZE=0
+          if [ -n "$VERS_LINE" ]; then
+            # 第 3 列是 size (hex)
+            VERS_SIZE=$((16#$(echo "$VERS_LINE" | awk '{print $3}')))
+            echo "  __versions 段: $VERS_LINE"
+            echo "  段大小: $VERS_SIZE 字节"
           else
-            echo "::warning::ko 内没有找到任何符号版本信息"
-            echo "  这会导致 CONFIG_MODVERSIONS 内核加载时校验失败"
+            echo "  未找到 __versions 段"
+          fi
+
+          # 每条记录 64 字节 (struct modversion_info: 56 字节 name + 4/8 字节 crc)
+          RECORDS=$((VERS_SIZE / 64))
+          echo "  估算 CRC 记录数: ~$RECORDS"
+
+          if [ "$VERS_SIZE" -gt 0 ]; then
+            echo "  OK: ko 已带 $VERS_SIZE 字节符号版本信息, 可在目标内核上做 modversions 校验"
+          else
+            echo "::error::ko 内没有 __versions 段"
+            echo "  这样的 ko 在 CONFIG_MODVERSIONS=y 的内核上会加载失败"
             echo "  --- ko 的段列表 ---"
             llvm-objdump -h "$KO" 2>/dev/null | head -n 30 || true
-            echo "  --- nomount.mod 是否存在 ---"
-            ls -la fs/nomount/ 2>/dev/null || true
+            exit 1
           fi
 
           echo "=== 关键 VFS 符号是否能在内核符号表中找到 ==="
+          SYMVERS_TABLE="./out/vmlinux.symvers"
+          [ -f "$SYMVERS_TABLE" ] || SYMVERS_TABLE="./out/Module.symvers"
+          if [ ! -f "$SYMVERS_TABLE" ]; then
+            echo "::warning::找不到内核符号表, 跳过此项检查"
+            SYMVERS_TABLE=/dev/null
+          fi
+          echo "  使用符号表: $SYMVERS_TABLE"
+
           MISSING=0
           for sym in d_lookup d_splice_alias d_add iget5_locked register_key_type \
                      generic_file_mmap generic_file_read_iter vfs_getattr \
