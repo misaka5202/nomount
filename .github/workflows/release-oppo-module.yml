@@ -260,37 +260,36 @@ jobs:
           done
           echo ">>> setlocalversion 输出已固定为: -$KSUFFIX"
           tail -n 3 common/scripts/setlocalversion
-      - name: 对齐 struct module 布局 (MITIGATION_ITS)
+      - name: 准备 BTF 工具链 (保留设备原样配置)
         run: |
           set -euo pipefail
           cd kernel_workspace/common
 
-          # 剔除注释后逐行比对设备 kheaders 与本树的 include/linux/module.h，
-          # struct module 的唯一实质差异是设备多出这一段:
+          # 这里不再修改 struct module 或 CONFIG_MITIGATION_ITS。
           #
-          #   #ifdef CONFIG_MITIGATION_ITS
-          #           int its_num_pages;
-          #           void **its_page_array;
-          #   #endif
+          # 教训: 之前依据 kheaders 的 module.h 判定"设备比开源树多两个
+          # ITS 字段"，于是注入它们并开启对应 Kconfig。但实测：
+          #   A) 关 BTF, 有 ITS : module_layout = 0xed15e86a
+          #   B) 开 BTF, 有 ITS : module_layout = 0x831c167a
+          #   目标              : 0xea759d7f
+          # 两个都不对。而 /proc/config.gz 与 kheaders/generated/autoconf.h
+          # 里**都没有** CONFIG_MITIGATION_ITS，说明设备内核根本没启用它 ——
+          # kheaders 的 module.h 与出货内核编译状态不一致（前面已用
+          # sizeof(struct module) 独立证实: 设备 1088 vs 我们 1024）。
           #
-          # 设备是 6.1.157, 本树是 6.1.134, 该 mitigation 由较新的 stable 引入,
-          # 所以树里既无这段字段也无对应 Kconfig。
+          # 所以以 /proc/config.gz 为准，不动任何结构体字段，
+          # 唯一要做的是让 BTF（设备 =y）能正常编译。
           #
-          # 这段字段决定 module_layout CRC:
-          #   设备 0xea759d7f  vs  本树 0xa26bedb1
-          # check_modstruct_version() 不匹配时返回 -ENOEXEC 且不打印任何日志;
-          # 强行改 CRC 会让 mod_sysfs_setup 越界 panic。所以必须让布局真正一致。
-          python3 "$GITHUB_WORKSPACE/scripts/patch_module_layout.py" .
-
-          echo "=== 确认字段已插入 ==="
-          grep -n -B1 -A2 'its_num_pages' include/linux/module.h || {
-            echo "::error::字段注入失败"; exit 1; }
-
-          # CONFIG_DEBUG_INFO_BTF_MODULES 必须保持 =y（它决定 struct module
-          # 是否包含 btf_data_size / btf_data 两个字段），因此 resolve_btfids
-          # 这个 host tool 必须能编译通过。Clang20 会把 libbpf 里一处
-          # const 限定符不匹配提升为 error，这里打补丁修掉。
+          # CONFIG_DEBUG_INFO_BTF_MODULES 决定 struct module 是否包含
+          # btf_data_size / btf_data 两个字段，必须保持设备原值。
+          # resolve_btfids 这个 host tool 在 Clang20 下有一处 const 限定符
+          # 报错，修在这里，而不是靠关闭 BTF 绕过。
           python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
+
+          echo "=== 确认未引入非设备字段 ==="
+          grep -n 'its_num_pages' include/linux/module.h && {
+            echo "::error::module.h 里出现了设备 config 未启用的字段"; exit 1; } || \
+            echo "  OK: 未注入 MITIGATION_ITS 字段"
 
 
 
@@ -385,16 +384,16 @@ jobs:
           # resolve_btfids 能编译通过（给 host tools 放宽 -Werror）。
           #
           # NOMOUNT 必须在此写入；fs/nomount/Kconfig 已在前一步挂载。
-          # MITIGATION_ITS 由 scripts/patch_module_layout.py 补了 Kconfig 条目，
-          # 这里显式打开，使 module.h 里的 #ifdef 成立（设备 kheaders 中该字段存在）。
-          ./scripts/config --file out/.config -m NOMOUNT -e MITIGATION_ITS
+          # 其余配置全部保持设备 /proc/config.gz 的原样，不做增删 ——
+          # 任何对 struct module 有影响的开关都必须与设备一致。
+          ./scripts/config --file out/.config -m NOMOUNT
 
           echo "=== 配置与设备一致性核对 ==="
           MISS=0
           for k in CONFIG_MODULES CONFIG_SYSFS CONFIG_FTRACE CONFIG_MODULE_UNLOAD \
                    CONFIG_KALLSYMS_ALL CONFIG_CFI_CLANG CONFIG_TRACEPOINTS \
                    CONFIG_JUMP_LABEL CONFIG_MODVERSIONS CONFIG_ARM64 \
-                   CONFIG_MITIGATION_ITS CONFIG_DEBUG_INFO_BTF_MODULES; do
+                   CONFIG_DEBUG_INFO_BTF_MODULES; do
             if grep -q "^${k}=y" out/.config; then
               echo "  OK    $k=y"
             else

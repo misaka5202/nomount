@@ -1,0 +1,23 @@
+﻿fix: keep BTF, drop the invented MITIGATION_ITS fields
+
+Two controlled data points now exist for module_layout:
+
+    A) BTF off, ITS on  -> 0xed15e86a
+    B) BTF on,  ITS on  -> 0x831c167a
+    device              -> 0xea759d7f
+
+Turning BTF on moved the CRC, confirming CONFIG_DEBUG_INFO_BTF_MODULES
+really does shape struct module. Neither combination matches, and the
+remaining untested variable is the ITS block itself.
+
+/proc/config.gz and kheaders' own include/generated/autoconf.h both lack
+CONFIG_MITIGATION_ITS, so the shipped kernel does not enable it. The
+module.h inside kheaders does contain the block, which is why it was
+mistaken for a real difference -- but kheaders has already been shown
+not to reflect the shipped build (sizeof(struct module): 1088 on device
+vs 1024 from that header set). /proc/config.gz is the reliable source.
+
+So stop editing struct module entirely: remove the ITS injection and its
+Kconfig entry, keep the device's BTF settings, and patch only the
+resolve_btfids toolchain issue. That leaves config exactly as the device
+reports it, which is the premise GKI KMI stability relies on.
