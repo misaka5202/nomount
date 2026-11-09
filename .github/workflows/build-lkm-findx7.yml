@@ -188,7 +188,13 @@ jobs:
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+            # 见 scripts/setlocalversion 末尾: LOCALVERSION 未设置且非 tag 状态时会追加 "+",
+            # 而 vermagic 里带 "+" 会导致设备 insmod 时版本不匹配直接拒绝加载。
+            # 强制在任何情况下都不追加 "+"。
+            sed -i 's|res="$res${scm:++}"|res="$res"|' "$f"
           done
+          echo "=== 确认 setlocalversion 已去掉 + 逻辑 ==="
+          grep -n 'scm:++|res="$res"' common/scripts/setlocalversion | head -n 5 || true
 
       - name: 生成内核配置 + modules_prepare
         run: |
@@ -326,35 +332,30 @@ jobs:
 
           # 外部模块 (M=) 构建时 scripts/Makefile.modpost 走的是 else 分支,
           # 只认 KBUILD_EXTMOD 目录下的 Module.symvers, 不会去读 out/vmlinux.symvers。
-          # 所以必须通过 KBUILD_EXTRA_SYMBOLS 显式把 vmlinux 的 CRC 表喂进去,
-          # 否则编出的 ko 符号版本信息为空, 设备上加载会失败或直接 panic。
-          if [ ! -f out/Module.symvers ]; then
-            if [ -f out/vmlinux.symvers ]; then
-              echo "    用 vmlinux.symvers 作为额外符号表 (KBUILD_EXTRA_SYMBOLS)"
-              EXTRA_SYMBOLS="KBUILD_EXTRA_SYMBOLS=$PWD/out/vmlinux.symvers"
-            else
-              echo "::error::既没有 out/Module.symvers 也没有 out/vmlinux.symvers"
-              exit 1
-            fi
-          else
-            EXTRA_SYMBOLS=""
-          fi
-
-          echo "=== 最终确认符号表 ==="
+          # 用 KBUILD_EXTRA_SYMBOLS 显式把 vmlinux 的 CRC 表喂进去。
+          #
+          # 注意: 必须用环境变量方式传, 不能拼成 "VAR=value" 塞进参数列表,
+          # 否则会被 make 当成 target 名, 结果就是 "Module.symvers is missing"
+          # 依旧出现, ko 里一个 __crc_ 都没有。
+          SYMVERS_TABLE=""
           if [ -f out/Module.symvers ]; then
-            ls -lh out/Module.symvers
-            echo "    条目数: $(wc -l < out/Module.symvers)"
+            SYMVERS_TABLE="$PWD/out/Module.symvers"
           elif [ -f out/vmlinux.symvers ]; then
-            ls -lh out/vmlinux.symvers
-            echo "    vmlinux.symvers 条目数: $(wc -l < out/vmlinux.symvers)"
+            SYMVERS_TABLE="$PWD/out/vmlinux.symvers"
+            echo "    使用 vmlinux.symvers (15286 条 CRC) 作为额外符号表"
           else
-            echo "::error::没有可用的符号表, 中止"
+            echo "::error::既没有 out/Module.symvers 也没有 out/vmlinux.symvers"
             exit 1
           fi
 
+          echo "=== 将使用的符号表 ==="
+          ls -lh "$SYMVERS_TABLE"
+          echo "    条目数: $(wc -l < "$SYMVERS_TABLE")"
+
           echo ">>> 编译 nomount.ko ..."
           echo "BUILD_CLANG=$(clang --version | head -n1)" >> "$GITHUB_ENV"
-          make -j"$(nproc)" $COMMON_FLAGS $EXTRA_SYMBOLS M="$PWD/fs/nomount" modules
+          export KBUILD_EXTRA_SYMBOLS="$SYMVERS_TABLE"
+          make -j"$(nproc)" $COMMON_FLAGS M="$PWD/fs/nomount" modules
 
           echo ">>> 查找产物..."
           find . -name 'nomount.ko' 2>/dev/null | head -n 20
@@ -377,7 +378,31 @@ jobs:
           KO=fs/nomount/nomount.ko
 
           echo "=== vermagic ==="
-          modinfo "$KO" 2>/dev/null | grep -E 'vermagic|name|version' || strings "$KO" | grep -m1 vermagic || true
+          VERMAGIC=$(modinfo -F vermagic "$KO" 2>/dev/null || strings "$KO" | grep -m1 'vermagic=' | sed 's/vermagic=//')
+          echo "  $VERMAGIC"
+          modinfo "$KO" 2>/dev/null | grep -E 'filename|version:|name:|srcversion' || true
+
+          echo "=== vermagic 必须与设备内核一致 ==="
+          case "$VERMAGIC" in
+            *"+"*)
+              echo "::error::vermagic 含 '+' ($VERMAGIC)"
+              echo "  设备内核 vermagic 不会有这个 '+'，insmod 会报 'version magic ... should be ...' 拒绝加载"
+              exit 1
+              ;;
+            *)
+              echo "  OK: vermagic 不含 '+'"
+              ;;
+          esac
+
+          KREL_STRIPPED="${KERNELRELEASE%%-g*}"
+          case "$VERMAGIC" in
+            *"$KREL_STRIPPED"*)
+              echo "  OK: vermagic 内核版本 ($KREL_STRIPPED) 与构建内核一致"
+              ;;
+            *)
+              echo "::warning::vermagic ($VERMAGIC) 与 KERNELRELEASE ($KERNELRELEASE) 不一致"
+              ;;
+          esac
 
           echo "=== 依赖的 VFS 符号 (抽样) ==="
           llvm-nm -u "$KO" 2>/dev/null | grep -E 'd_lookup|generic_file_mmap|iget5_locked|vfs_getattr|d_splice_alias|d_add|register_key_type' || true
