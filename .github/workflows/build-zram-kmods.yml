@@ -88,18 +88,25 @@ jobs:
           # ko 到设备上会静默 ENOEXEC。
           #
           # runner 的 apt 偶发 DNS 故障("Temporary failure resolving
-          # 'azure.archive.ubuntu.com'")，重试即可，无需更换镜像。
-          tries=5; i=1
+          # 'azure.archive.ubuntu.com'")，重试可恢复。
+          #
+          # 但要给每一层都设硬上限: 单次 apt-get update + install 在 DNS
+          # 完全失效时会各耗 1-2 分钟(多个镜像依次超时)，5 轮重试就能拖到
+          # 20 分钟。曾经因此连续三次 run 卡在这一步被手工取消。
+          timeout 180 sudo apt-get update -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=10 || echo "::warning::apt-get update 超时，继续"
+
+          tries=3; i=1
           while [ "$i" -le "$tries" ]; do
-            if sudo apt-get update -o Acquire::Retries=5 && \
-               sudo apt-get install -y --no-install-recommends \
-                 -o Acquire::Retries=5 --fix-missing \
+            if timeout 300 sudo apt-get install -y --no-install-recommends \
+                 -o Acquire::Retries=3 -o Acquire::http::Timeout=10 \
+                 --fix-missing \
                  binutils python-is-python3 libssl-dev libelf-dev zip xz-utils; then
               echo ">>> 依赖安装完成"
               break
             fi
-            echo "::warning::apt 失败 (第 $i/$tries 次)，20s 后重试"
-            i=$((i+1)); sleep 20
+            echo "::warning::apt 失败 (第 $i/$tries 次)，15s 后重试"
+            i=$((i+1)); sleep 15
           done
           dpkg -s libelf-dev >/dev/null 2>&1 || { echo "::error::libelf-dev 未装上"; exit 1; }
 
