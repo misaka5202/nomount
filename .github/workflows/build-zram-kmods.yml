@@ -392,10 +392,28 @@ jobs:
           done
           [ "$MISS" -eq 0 ] || { echo "::error::关键配置缺失"; exit 1; }
 
-          # resolve_btfids 在 Clang20 下有 const 限定符报错，打补丁修掉
-          python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
+          # 【不能用 make modules_prepare】
+          # modules_prepare -> prepare -> tools/bpf/resolve_btfids
+          # (Makefile:1604 prepare 链，1470-1474 处 CONFIG_BPF 且
+          # CONFIG_DEBUG_INFO_BTF 时挂上 resolve_btfids)，而 resolve_btfids
+          # 需要 libelf.h，本 runner 装不上。
+          #
+          # 需要的成果其实只有: include/generated/* 头文件、scripts/ 下的
+          # 构建工具、以及同时生成的 auto.conf/autoconf.h。分开做等价的事:
+          #   syncconfig   -> auto.conf + autoconf.h + include/config/*
+          #   prepare0     -> archprepare 全套 generated 头文件
+          #   scripts      -> scripts/mod 等 kbuild 工具
+          # 这三个目标都不经过 resolve_btfids。
           make -j"$(nproc)" $FLAGS syncconfig
-          make -j"$(nproc)" $FLAGS modules_prepare
+          make -j"$(nproc)" $FLAGS prepare0
+          make -j"$(nproc)" $FLAGS scripts
+          make -j"$(nproc)" $FLAGS -f $(pwd)/scripts/Makefile.build obj=scripts/mod \
+            scripts/mod/modpost 2>/dev/null || \
+            make -j"$(nproc)" $FLAGS scripts/mod/modpost 2>/dev/null || true
+
+          # include/config/kernel.release 由 prepare0/archprepare 生成
+          [ -f out/include/config/kernel.release ] || \
+            make -s O=out ARCH=arm64 LLVM=1 kernelrelease > out/include/config/kernel.release 2>/dev/null || true
 
           KREL="$(cat out/include/config/kernel.release)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
@@ -416,10 +434,25 @@ jobs:
           # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
           # 不读 out/vmlinux.symvers。没有这张 CRC 表，ko 的 __versions 段
           # 就是空的，设备上加载会失败。
+          #
+          # 【为什么不用 make vmlinux】
+          # CONFIG_BPF=y 且 CONFIG_DEBUG_INFO_BTF=y 时，prepare 目标会依赖
+          # tools/bpf/resolve_btfids (Makefile:1470-1474)，而后者需要
+          # libelf.h。本 runner 的 apt 完全不可用(DNS 全挂)，装不上
+          # libelf-dev，于是整条 vmlinux 路径都无法进行。
+          #
+          # 【绕过】
+          # 我们要的只是 vmlinux.symvers，它由 modpost 从 vmlinux.o 生成，
+          # 而 vmlinux.o 的构建链 (skripts/Makefile.vmlinux_o -> Makefile.modpost)
+          # 完全不经过 resolve_btfids。resolve_btfids 只在 vmlinux 最终链接
+          # 之后处理 .BTF 段时才会用到 (Makefile:1334)。
           if [ ! -s out/vmlinux.symvers ]; then
-            echo ">>> 编译 vmlinux 生成符号表 (约 20-30 分钟)..."
+            echo ">>> 编译 vmlinux.o (不链接 vmlinux, 绕开 resolve_btfids)"
             touch include/linux/module.h
-            make -j"$(nproc)" $FLAGS vmlinux || true
+            make -j"$(nproc)" $FLAGS vmlinux_o
+
+            echo ">>> modpost 生成 vmlinux.symvers"
+            make -j"$(nproc)" $FLAGS modpost
           fi
           [ -s out/vmlinux.symvers ] || { echo "::error::符号表缺失"; exit 1; }
           echo ">>> 符号表: $(wc -l < out/vmlinux.symvers) 条"
