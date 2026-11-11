@@ -207,7 +207,16 @@ jobs:
           path: |
             kernel_workspace/common
             kernel_workspace/vendor
-          key: zram-kernel-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v1
+          # key 里带 runner 镜像标识: 换 runner 版本后必须重新解包。
+          #
+          # out/ 是 O=out 的输出目录，位于 common/ 内部，会随这个缓存一起
+          # 被保存。其中的 .cmd 文件记录着 host tool 依赖的绝对头文件路径。
+          # 在 ubuntu-latest(26.04, glibc 2.39) 上构建时记下了
+          # /usr/include/x86_64-linux-gnu/bits/mman_ext.h，换到 22.04
+          # (glibc 2.35) 后该文件不存在，make 直接报
+          #   No rule to make target '.../mman_ext.h', needed by fixdep.o
+          # 无论换哪个镜像都一致地失败。
+          key: zram-kernel-${{ runner.os }}-${{ runner.arch }}-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v2
 
       - name: 准备内核源码与 vendor
         run: |
@@ -342,6 +351,15 @@ jobs:
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
             CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          # out/ 可能来自缓存，其中的 .cmd 记录着上一台 runner 的 host tool
+          # 头文件绝对路径。换镜像后(26.04 -> 22.04)这些路径指向不存在的
+          # 文件，make 会报 "No rule to make target .../mman_ext.h"。
+          # 源码树本身不需要 out/，直接清掉重新生成。
+          if [ -d out ]; then
+            echo ">>> 清理缓存带来的 out/ (含跨镜像的 .cmd 依赖记录)"
+            rm -rf out
+          fi
 
           # 先让树基于 gki_defconfig 生成自洽 .config，再把设备 /proc/config.gz
           # 显式声明的每一项覆盖上去。两个都不能单独用:
