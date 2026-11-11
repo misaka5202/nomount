@@ -110,16 +110,21 @@ def main():
     #    In-tree it does "#include <linux/zstd_errors.h>", which would
     #    resolve to the kernel's copy. Use the vendored one so the enum
     #    layout matches the zstd build we are linking.
+    #
+    #    The include is quoted, so it resolves relative to this file:
+    #    vendor/lib/zstd/common/ -> ../../../include/linux/zstd_errors.h
+    #    A plain "vendor/include/..." path does not work here and fails
+    #    with 'vendor/include/linux/zstd_errors.h' file not found.
     err_h = os.path.join(vendor, 'lib', 'zstd', 'common', 'error_private.h')
     if os.path.isfile(err_h):
         with open(err_h, encoding='utf-8', errors='replace') as fh:
             text = fh.read()
         old = '#include <linux/zstd_errors.h>'
-        new = '#include "vendor/include/linux/zstd_errors.h"'
-        if old in text and new not in text:
+        new = '#include "../../../include/linux/zstd_errors.h"'
+        if old in text:
             with open(err_h, 'w', encoding='utf-8') as fh:
                 fh.write(text.replace(old, new, 1))
-            print('[zstdp] error_private.h -> vendored zstd_errors.h')
+            print('[zstdp] error_private.h -> ../../../include/linux/zstd_errors.h')
 
     print(f'[zstdp] staged into {dest}')
 
