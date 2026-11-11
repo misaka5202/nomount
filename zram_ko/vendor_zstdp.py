@@ -101,6 +101,23 @@ def main():
         text = text.replace('subdir-ccflags-y += -I$(objtree)/$(obj)/vendor/include',
                             'subdir-ccflags-y += -I$(obj)/vendor/include')
 
+        # zstd_preSplit.c exists only in newer zstd (6.6+ kernel trees).
+        # This device runs 6.1, whose lib/zstd has no such source. The
+        # wrapper never calls the pre-split API, so the object is
+        # unnecessary; leaving the line in breaks the link with
+        # "No rule to make target .../zstd_preSplit.o".
+        dropped = []
+        kept = []
+        for line in text.split('\n'):
+            if 'zstd_preSplit.o' in line:
+                dropped.append(line.strip())
+                continue
+            kept.append(line)
+        if dropped:
+            text = '\n'.join(kept)
+            print(f'[zstdp] dropped {len(dropped)} reference(s) to '
+                  'vendor/lib/zstd/compress/zstd_preSplit.o (absent in 6.1)')
+
         with open(mk, 'w', encoding='utf-8') as fh:
             fh.write(text)
         print('[zstdp] Makefile -> obj-m, include paths rebased to $(src)/$(obj)')
@@ -127,6 +144,42 @@ def main():
             print('[zstdp] error_private.h -> ../../../include/linux/zstd_errors.h')
 
     print(f'[zstdp] staged into {dest}')
+
+    # 移除 vendored zstd 里的 EXPORT_SYMBOL。
+    #
+    # 设备内核 CONFIG_CRYPTO_ZSTD=y，vmlinux 已经导出了 ZSTD_isError、
+    # ZSTD_getErrorCode、ZSTD_customMalloc 等符号。vendored zstd 的
+    # zstd_common.c / entropy_common.c 里也有 EXPORT_SYMBOL_GPL，
+    # objcopy --redefine-syms 只会改符号名，__ksymtab 里的导出记录仍指向
+    # 原名，于是 modpost 报:
+    #   ERROR: modpost: 'ZSTD_getErrorCode' exported twice.
+    #          Previous export was in vmlinux
+    #
+    # zstdp 只需要静态链接这些实现，不需要把任何 zstd 符号再导出一遍，
+    # 因此直接删掉这些行。
+    removed = 0
+    for rel in ('vendor/lib/zstd/common/zstd_common.c',
+                'vendor/lib/zstd/common/entropy_common.c',
+                'vendor/lib/zstd/zstd_compress_module.c',
+                'vendor/lib/zstd/zstd_decompress_module.c'):
+        path = os.path.join(dest, rel)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            lines = fh.readlines()
+        kept = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('EXPORT_SYMBOL'):
+                removed += 1
+                continue
+            kept.append(line)
+        if len(kept) != len(lines):
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.writelines(kept)
+    if removed:
+        print(f'[zstdp] dropped {removed} EXPORT_SYMBOL line(s) from vendored zstd '
+              '(they collide with the kernel\'s built-in zstd exports)')
 
 
 if __name__ == '__main__':

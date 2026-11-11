@@ -96,12 +96,22 @@ jobs:
           timeout 180 sudo apt-get update -o Acquire::Retries=2 \
             -o Acquire::http::Timeout=10 || echo "::warning::apt-get update 超时，继续"
 
+          # dwarves 提供 pahole。这不是可选项:
+          #   config PAHOLE_HAS_SPLIT_BTF
+          #           def_bool PAHOLE_VERSION >= 119
+          # 而 CONFIG_DEBUG_INFO_BTF_MODULES 依赖 PAHOLE_HAS_SPLIT_BTF。
+          # 没有 pahole 时 scripts/pahole-version.sh 返回 0，Kconfig 就把
+          # BTF_MODULES 关掉，struct module 随之少了 btf_data_size/btf_data
+          # 两个字段(共 16 字节)，module_layout 的 CRC 算成 0xa26bedb1
+          # 而不是设备的 0xea759d7f，ko 上机静默 ENOEXEC。
+          # 在 WSL 复现时正是漏装 pahole 导致了这个问题。
           tries=3; i=1
           while [ "$i" -le "$tries" ]; do
-            if timeout 300 sudo apt-get install -y --no-install-recommends \
+            if timeout 420 sudo apt-get install -y --no-install-recommends \
                  -o Acquire::Retries=3 -o Acquire::http::Timeout=10 \
                  --fix-missing \
-                 binutils python-is-python3 libssl-dev libelf-dev zip xz-utils; then
+                 binutils python-is-python3 libssl-dev libelf-dev dwarves \
+                 zip xz-utils; then
               echo ">>> 依赖安装完成"
               break
             fi
@@ -109,6 +119,9 @@ jobs:
             i=$((i+1)); sleep 15
           done
           dpkg -s libelf-dev >/dev/null 2>&1 || { echo "::error::libelf-dev 未装上"; exit 1; }
+          dpkg -s dwarves >/dev/null 2>&1 || { echo "::error::dwarves(pahole) 未装上"; exit 1; }
+
+          echo ">>> pahole: $(pahole --version 2>/dev/null || echo missing)"
 
           # python3 / make / gcc / bc 等 runner 自带，确认一下
           for c in python3 make gcc bc ld zip xz unzip; do
@@ -357,6 +370,31 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
           make -j"$(nproc)" $FLAGS syncconfig
           make -j"$(nproc)" $FLAGS modules_prepare
+
+          # 【关键防线】syncconfig 之后必须复查 BTF_MODULES。
+          #
+          # overlay 脚本会把它写入 .config，但 syncconfig 会按 Kconfig 规则
+          # 重新裁决。DEBUG_INFO_BTF_MODULES 依赖 PAHOLE_HAS_SPLIT_BTF，
+          # 后者依赖 PAHOLE_VERSION >= 119 —— 而 PAHOLE_VERSION 来自
+          # scripts/pahole-version.sh，pahole 不存在时返回 0。
+          # 一旦被裁决掉，struct module 少 16 字节，module_layout 变成
+          # 0xa26bedb1，与设备的 0xea759d7f 不符，ko 上机静默 ENOEXEC。
+          #
+          # 这里在编译前就拦住，而不是等到发布后才发现。
+          echo "=== syncconfig 后的 BTF 相关配置 ==="
+          for k in CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES \
+                   CONFIG_PAHOLE_VERSION CONFIG_PAHOLE_HAS_SPLIT_BTF; do
+            if grep -q "^${k}=" out/.config; then
+              echo "  $(grep "^${k}=" out/.config | head -n1)"
+            else
+              echo "  # $k is not set"
+            fi
+          done
+          if ! grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' out/.config; then
+            echo "::error::CONFIG_DEBUG_INFO_BTF_MODULES 被裁掉，struct module 布局会错，module_layout 必然不匹配"
+            echo "          检查 pahole 是否安装(dwarves 包)以及 PAHOLE_VERSION 是否 >= 119"
+            exit 1
+          fi
 
           KREL="$(cat out/include/config/kernel.release)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
