@@ -113,14 +113,25 @@ jobs:
             echo ">>> 构建依赖齐备，跳过 apt"
           fi
 
-          # libelf-dev 是内核构建的必需项，单独确认
+          # libelf-dev 提供 libelf.h，供 pahole/BTF 相关工具链接使用。
+          # 但本构建不产出 BTF（modules_prepare + modules，不跑 resolve_btfids
+          # 的 BTF 编码路径），实测缺它也能源码编译内核模块。
+          #
+          # 而且 GitHub runner 的 DNS 时常整体失效，三个 ubuntu 镜像域名
+          # 全部 "Temporary failure resolving"，此时任何 apt 下载都不可能成功，
+          # 重试只是浪费时间。所以这里是警告而非失败，让构建继续，
+          # 真的需要它时后面的编译会给出明确报错。
           if dpkg -s libelf-dev >/dev/null 2>&1; then
             echo "  OK libelf-dev"
           else
-            echo "  libelf-dev 缺失，安装"
-            timeout 240 sudo apt-get install -y --no-install-recommends \
-              -o Acquire::Retries=3 -o Acquire::http::Timeout=10 libelf-dev || {
-              echo "::error::libelf-dev 安装失败"; exit 1; }
+            echo "  libelf-dev 缺失，尝试安装(失败不阻断)"
+            if timeout 240 sudo apt-get install -y --no-install-recommends \
+                 -o Acquire::Retries=2 -o Acquire::http::Timeout=10 libelf-dev; then
+              echo "  OK libelf-dev 已安装"
+            else
+              echo "::warning::libelf-dev 装不上(runner DNS 故障)，继续构建"
+              echo "          本流程不依赖 BTF，预计不影响编译"
+            fi
           fi
 
           # python3 / make / gcc / bc 等 runner 自带，确认一下
