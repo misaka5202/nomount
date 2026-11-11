@@ -73,28 +73,40 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-mark hold firefox libc-bin >/dev/null 2>&1 || true
-          sudo apt purge man-db >/dev/null 2>&1 || true
-          sudo rm -rf /var/lib/man-db/auto-update || true
 
-          # apt 在 runner 上偶发 DNS 抖动（"Temporary failure resolving
-          # 'security.ubuntu.com'"），一次失败就会带走整个 job。
-          # 重试 + 退避，并允许 --fix-missing。
-          apt_install() {
-            local tries=5 i=1
+          # ubuntu-latest 已预装 binutils / python3 / libssl-dev / zip / xz。
+          # 真正可能缺的只有 libelf-dev 和 libelf 头文件，其余直接跳过，
+          # 减少 apt 暴露面（runner 的 DNS 偶发抖动，一次 fetch 失败就整个
+          # job 挂掉，之前已因此浪费两轮）。
+          need=""
+          for pkg in libelf-dev; do
+            if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+              need="$need $pkg"
+            fi
+          done
+
+          if [ -n "$need" ]; then
+            echo ">>> 需要安装:$need"
+            tries=4; i=1
             while [ "$i" -le "$tries" ]; do
-              if sudo apt-get update -o Acquire::Retries=5 && \
-                 sudo apt-get install -y --no-install-recommends \
-                   -o Acquire::Retries=5 --fix-missing "$@"; then
-                return 0
+              # 不跑 apt-get update: runner 的索引已就绪，update 只在 DNS
+              # 抖动时增加失败面。Acquire::Retries 让单次 fetch 自身重试。
+              if sudo apt-get install -y --no-install-recommends \
+                   -o Acquire::Retries=8 --fix-missing $need; then
+                break
               fi
-              echo "::warning::apt 失败 (第 $i/$tries 次), 10s 后重试"
-              i=$((i+1)); sleep 10
+              echo "::warning::apt 失败 (第 $i/$tries 次)"
+              i=$((i+1)); sleep 8
             done
-            echo "::error::apt 多次重试仍失败"
-            return 1
-          }
+            dpkg -s libelf-dev >/dev/null 2>&1 || { echo "::error::libelf-dev 未装上"; exit 1; }
+          else
+            echo ">>> 依赖已齐备，跳过 apt"
+          fi
 
-          apt_install binutils python-is-python3 libssl-dev libelf-dev zip xz-utils
+          # python3 / make / gcc / bc 等 runner 自带，确认一下
+          for c in python3 make gcc bc ld zip xz unzip; do
+            command -v "$c" >/dev/null || echo "::warning::缺命令 $c"
+          done
 
           mkdir -p kernel_workspace
           cd kernel_workspace
