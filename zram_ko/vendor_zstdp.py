@@ -78,6 +78,33 @@ def main():
         else:
             print(f'[zstdp] WARNING: missing {src}')
 
+    # ABK's Makefile gates the module on CONFIG_CRYPTO_ZSTDP, which only
+    # exists once its Kconfig is sourced into the tree. Building out of
+    # tree we have no such symbol, so `obj-$(CONFIG_CRYPTO_ZSTDP)` expands
+    # to nothing, make reports success and modpost runs without ever
+    # linking a .ko. Force obj-m and drop the subdir-ccflags (which assume
+    # an in-tree layout).
+    mk = os.path.join(dest, 'Makefile')
+    if os.path.isfile(mk):
+        with open(mk, encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+
+        text = text.replace('obj-$(CONFIG_CRYPTO_ZSTDP) += zstdp.o',
+                            'obj-m += zstdp.o')
+
+        # srctree/objtree point at the kernel tree, but these sources live
+        # beside the module; use $(src) and $(obj) directly.
+        text = text.replace('subdir-ccflags-y += -I$(srctree)/$(src)\n', '')
+        text = text.replace('subdir-ccflags-y += -I$(objtree)/$(obj)\n', '')
+        text = text.replace('subdir-ccflags-y += -I$(srctree)/$(src)/vendor/include',
+                            'subdir-ccflags-y += -I$(src)/vendor/include')
+        text = text.replace('subdir-ccflags-y += -I$(objtree)/$(obj)/vendor/include',
+                            'subdir-ccflags-y += -I$(obj)/vendor/include')
+
+        with open(mk, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        print('[zstdp] Makefile -> obj-m, include paths rebased to $(src)/$(obj)')
+
     # 3. point error_private.h at the vendored zstd_errors.h
     #
     #    In-tree it does "#include <linux/zstd_errors.h>", which would

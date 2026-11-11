@@ -347,9 +347,11 @@ jobs:
             if make -j"$(nproc)" $FLAGS M="$MODDIR" modules; then
               find "$MODDIR" -name "${m}*.ko" -exec cp -v {} "$OUT/" \;
             else
-              echo "::error::$m 编译失败"
+              echo "::error::$m make 失败"
               exit 1
             fi
+            # make 返回 0 但没链接出 .ko 时也必须失败，否则会静默产出缺件包
+            [ -f "$OUT/$m.ko" ] || { echo "::error::$m.ko 未生成"; ls -la "$MODDIR" | head -n 20; exit 1; }
           done
 
           echo "=== 产物 ==="
@@ -380,7 +382,17 @@ jobs:
           if make -j"$(nproc)" $FLAGS M="$MODDIR" modules; then
             find "$MODDIR" -name 'zstdp*.ko' -exec cp -v {} "$OUT/" \;
           else
-            echo "::error::zstdp 编译失败"
+            echo "::error::zstdp make 失败"
+            exit 1
+          fi
+
+          # make 成功但没链接出 .ko 是这类 out-of-tree 构建的典型陷阱:
+          # obj-$(CONFIG_X) 的符号不存在时 obj- 展开为空，make 判定无事可做,
+          # 只跑 modpost 就返回 0。必须显式确认产物存在。
+          if [ ! -f "$OUT/zstdp.ko" ]; then
+            echo "::error::未生成 zstdp.ko (obj-m 未生效?)"
+            echo "--- MODDIR 内容 ---"
+            ls -la "$MODDIR" | head -n 30
             exit 1
           fi
 
