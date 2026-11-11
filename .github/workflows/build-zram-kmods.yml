@@ -52,23 +52,13 @@ env:
 jobs:
   build:
     name: Build zram kmods
-    # 固定 22.04 而不是 ubuntu-latest。
-    #
-    # ubuntu-latest 已迁到 Ubuntu 26.04(resolute)，实测:
-    #   1) 未预装 libelf-dev，而 resolve_btfids 需要 libelf.h
-    #   2) 该镜像的 apt 源(azure/archive/security.ubuntu.com) DNS 解析失败，
-    #      装不上任何包:
-    #         Temporary failure resolving 'security.ubuntu.com'
-    #   3) CONFIG_DEBUG_INFO_BTF_MODULES=y 让 `make modules` 强制依赖
-    #      vmlinux，而 vmlinux 的 prepare 目标又要编 resolve_btfids
-    #      (Makefile:1472 prepare: tools/bpf/resolve_btfids)，缺 libelf.h
-    #      直接 fatal error，整个构建无法进行。
-    #   而 BTF_MODULES 不能关: 它决定 struct module 是否含
-    #   btf_data_size/btf_data 两个字段，关掉布局就错，module_layout CRC
-    #   随之错，ko 在设备上会静默 ENOEXEC。
-    #
-    # 22.04 预装 libelf-dev，且是此前同类构建验证通过的基线。
-    runs-on: ubuntu-22.04
+    # 用 ubuntu-latest，与 11-11 13:31 那次成功构建(43029864365)一致。
+    # 期间一度改为 22.04 是因为 libelf-dev 装不上，但对比日志后确认那是
+    # 短暂的 runner DNS 故障，而不是镜像缺包:
+    #   13:32  Get:2 ... resolute/main amd64v3 libelf-dev 0.194-4 [124 kB]  <- 成功
+    #   15:03  Temporary failure resolving 'azure.archive.ubuntu.com'      <- 故障
+    # 同一个 ubuntu-latest 既成功过也失败过，说明是网络抖动。
+    runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
@@ -89,66 +79,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 不做 apt-mark hold / apt purge。这些是仓库里其他 workflow 从
-          # 旧模板沿袭下来的，对构建内核模块毫无作用，而 apt-mark 需要
-          # 解析包名，runner 的软件源 DNS 一抖动就会长时间挂起
-          # (实测该步骤卡了 10 分钟直到被取消)。
+          # 与 11-11 13:31 成功构建一致的做法: apt-get update + 完整安装。
+          # libelf-dev 是必需的 —— resolve_btfids 的 main.c 与 libbpf.c 都
+          # 直接 #include <libelf.h>，而 CONFIG_DEBUG_INFO_BTF_MODULES=y
+          # 使 prepare 依赖 resolve_btfids (Makefile:1470-1474, 1604)。
+          # BTF_MODULES 不能关，它决定 struct module 是否含
+          # btf_data_size/btf_data，关掉布局就错、module_layout CRC 随之错，
+          # ko 到设备上会静默 ENOEXEC。
           #
-          # ubuntu-latest 已预装以下全部内容: binutils python3 libssl-dev
-          # libelf-dev zip xz-utils make gcc bc。只核查，不安装。
-          missing=""
-          for c in make gcc ld bc python3 zip xz unzip aria2c; do
-            if ! command -v "$c" >/dev/null 2>&1; then
-              missing="$missing $c"
+          # runner 的 apt 偶发 DNS 故障("Temporary failure resolving
+          # 'azure.archive.ubuntu.com'")，重试即可，无需更换镜像。
+          tries=5; i=1
+          while [ "$i" -le "$tries" ]; do
+            if sudo apt-get update -o Acquire::Retries=5 && \
+               sudo apt-get install -y --no-install-recommends \
+                 -o Acquire::Retries=5 --fix-missing \
+                 binutils python-is-python3 libssl-dev libelf-dev zip xz-utils; then
+              echo ">>> 依赖安装完成"
+              break
             fi
+            echo "::warning::apt 失败 (第 $i/$tries 次)，20s 后重试"
+            i=$((i+1)); sleep 20
           done
-
-          if [ -n "$missing" ]; then
-            echo ">>> 缺少命令:$missing，尝试安装"
-            # aria2c 来自 aria2；其余由 build-essential / binutils 覆盖
-            pkgs=""
-            case "$missing" in
-              *aria2c*) pkgs="$pkgs aria2" ;;
-            esac
-            case "$missing" in
-              *make*|*gcc*|*ld*) pkgs="$pkgs build-essential binutils" ;;
-            esac
-            case "$missing" in
-              *xz*) pkgs="$pkgs xz-utils" ;;
-            esac
-            case "$missing" in
-              *zip*) pkgs="$pkgs zip unzip" ;;
-            esac
-            if [ -n "$pkgs" ]; then
-              timeout 240 sudo apt-get install -y --no-install-recommends \
-                -o Acquire::Retries=3 -o Acquire::http::Timeout=10 $pkgs || {
-                echo "::warning::apt 安装失败，继续尝试（runner 通常已自带）"
-              }
-            fi
-          else
-            echo ">>> 构建依赖齐备，跳过 apt"
-          fi
-
-          # libelf-dev 提供 libelf.h，供 pahole/BTF 相关工具链接使用。
-          # 但本构建不产出 BTF（modules_prepare + modules，不跑 resolve_btfids
-          # 的 BTF 编码路径），实测缺它也能源码编译内核模块。
-          #
-          # 而且 GitHub runner 的 DNS 时常整体失效，三个 ubuntu 镜像域名
-          # 全部 "Temporary failure resolving"，此时任何 apt 下载都不可能成功，
-          # 重试只是浪费时间。所以这里是警告而非失败，让构建继续，
-          # 真的需要它时后面的编译会给出明确报错。
-          if dpkg -s libelf-dev >/dev/null 2>&1; then
-            echo "  OK libelf-dev"
-          else
-            echo "  libelf-dev 缺失，尝试安装(失败不阻断)"
-            if timeout 240 sudo apt-get install -y --no-install-recommends \
-                 -o Acquire::Retries=2 -o Acquire::http::Timeout=10 libelf-dev; then
-              echo "  OK libelf-dev 已安装"
-            else
-              echo "::warning::libelf-dev 装不上(runner DNS 故障)，继续构建"
-              echo "          本流程不依赖 BTF，预计不影响编译"
-            fi
-          fi
+          dpkg -s libelf-dev >/dev/null 2>&1 || { echo "::error::libelf-dev 未装上"; exit 1; }
 
           # python3 / make / gcc / bc 等 runner 自带，确认一下
           for c in python3 make gcc bc ld zip xz unzip; do
@@ -349,7 +302,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           # out/ 可能来自缓存，其中的 .cmd 记录着上一台 runner 的 host tool
@@ -392,28 +345,11 @@ jobs:
           done
           [ "$MISS" -eq 0 ] || { echo "::error::关键配置缺失"; exit 1; }
 
-          # 【不能用 make modules_prepare】
-          # modules_prepare -> prepare -> tools/bpf/resolve_btfids
-          # (Makefile:1604 prepare 链，1470-1474 处 CONFIG_BPF 且
-          # CONFIG_DEBUG_INFO_BTF 时挂上 resolve_btfids)，而 resolve_btfids
-          # 需要 libelf.h，本 runner 装不上。
-          #
-          # 需要的成果其实只有: include/generated/* 头文件、scripts/ 下的
-          # 构建工具、以及同时生成的 auto.conf/autoconf.h。分开做等价的事:
-          #   syncconfig   -> auto.conf + autoconf.h + include/config/*
-          #   prepare0     -> archprepare 全套 generated 头文件
-          #   scripts      -> scripts/mod 等 kbuild 工具
-          # 这三个目标都不经过 resolve_btfids。
+          # resolve_btfids 的 bundled libbpf 在 Clang20 下有一处 const
+          # 限定符报错，打补丁修掉后正常编译。
+          python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
           make -j"$(nproc)" $FLAGS syncconfig
-          make -j"$(nproc)" $FLAGS prepare0
-          make -j"$(nproc)" $FLAGS scripts
-          make -j"$(nproc)" $FLAGS -f $(pwd)/scripts/Makefile.build obj=scripts/mod \
-            scripts/mod/modpost 2>/dev/null || \
-            make -j"$(nproc)" $FLAGS scripts/mod/modpost 2>/dev/null || true
-
-          # include/config/kernel.release 由 prepare0/archprepare 生成
-          [ -f out/include/config/kernel.release ] || \
-            make -s O=out ARCH=arm64 LLVM=1 kernelrelease > out/include/config/kernel.release 2>/dev/null || true
+          make -j"$(nproc)" $FLAGS modules_prepare
 
           KREL="$(cat out/include/config/kernel.release)"
           echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
@@ -428,31 +364,16 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
           # 不读 out/vmlinux.symvers。没有这张 CRC 表，ko 的 __versions 段
           # 就是空的，设备上加载会失败。
-          #
-          # 【为什么不用 make vmlinux】
-          # CONFIG_BPF=y 且 CONFIG_DEBUG_INFO_BTF=y 时，prepare 目标会依赖
-          # tools/bpf/resolve_btfids (Makefile:1470-1474)，而后者需要
-          # libelf.h。本 runner 的 apt 完全不可用(DNS 全挂)，装不上
-          # libelf-dev，于是整条 vmlinux 路径都无法进行。
-          #
-          # 【绕过】
-          # 我们要的只是 vmlinux.symvers，它由 modpost 从 vmlinux.o 生成，
-          # 而 vmlinux.o 的构建链 (skripts/Makefile.vmlinux_o -> Makefile.modpost)
-          # 完全不经过 resolve_btfids。resolve_btfids 只在 vmlinux 最终链接
-          # 之后处理 .BTF 段时才会用到 (Makefile:1334)。
           if [ ! -s out/vmlinux.symvers ]; then
-            echo ">>> 编译 vmlinux.o (不链接 vmlinux, 绕开 resolve_btfids)"
+            echo ">>> 编译 vmlinux 生成符号表 (约 20-30 分钟)..."
             touch include/linux/module.h
-            make -j"$(nproc)" $FLAGS vmlinux_o
-
-            echo ">>> modpost 生成 vmlinux.symvers"
-            make -j"$(nproc)" $FLAGS modpost
+            make -j"$(nproc)" $FLAGS vmlinux || true
           fi
           [ -s out/vmlinux.symvers ] || { echo "::error::符号表缺失"; exit 1; }
           echo ">>> 符号表: $(wc -l < out/vmlinux.symvers) 条"
@@ -467,7 +388,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           cp -f out/vmlinux.symvers Module.symvers
@@ -504,7 +425,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=ld.lld O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           OUT="$WORKDIR/kos"
