@@ -340,7 +340,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           # 先让树基于 gki_defconfig 生成自洽 .config，再把设备 /proc/config.gz
@@ -392,7 +392,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
@@ -416,7 +416,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           cp -f out/vmlinux.symvers Module.symvers
@@ -453,7 +453,7 @@ jobs:
           cd kernel_workspace/common
 
           FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            CC=clang LD=ld.lld HOSTCC=gcc HOSTLD=ld HOSTAR=ar O=out
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
 
           OUT="$WORKDIR/kos"
