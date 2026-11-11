@@ -52,7 +52,23 @@ env:
 jobs:
   build:
     name: Build zram kmods
-    runs-on: ubuntu-latest
+    # 固定 22.04 而不是 ubuntu-latest。
+    #
+    # ubuntu-latest 已迁到 Ubuntu 26.04(resolute)，实测:
+    #   1) 未预装 libelf-dev，而 resolve_btfids 需要 libelf.h
+    #   2) 该镜像的 apt 源(azure/archive/security.ubuntu.com) DNS 解析失败，
+    #      装不上任何包:
+    #         Temporary failure resolving 'security.ubuntu.com'
+    #   3) CONFIG_DEBUG_INFO_BTF_MODULES=y 让 `make modules` 强制依赖
+    #      vmlinux，而 vmlinux 的 prepare 目标又要编 resolve_btfids
+    #      (Makefile:1472 prepare: tools/bpf/resolve_btfids)，缺 libelf.h
+    #      直接 fatal error，整个构建无法进行。
+    #   而 BTF_MODULES 不能关: 它决定 struct module 是否含
+    #   btf_data_size/btf_data 两个字段，关掉布局就错，module_layout CRC
+    #   随之错，ko 在设备上会静默 ENOEXEC。
+    #
+    # 22.04 预装 libelf-dev，且是此前同类构建验证通过的基线。
+    runs-on: ubuntu-22.04
     timeout-minutes: 180
 
     steps:
