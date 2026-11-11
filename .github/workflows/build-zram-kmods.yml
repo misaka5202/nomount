@@ -87,16 +87,18 @@ jobs:
 
           if [ -n "$need" ]; then
             echo ">>> 需要安装:$need"
-            tries=4; i=1
+            tries=3; i=1
             while [ "$i" -le "$tries" ]; do
               # 不跑 apt-get update: runner 的索引已就绪，update 只在 DNS
               # 抖动时增加失败面。Acquire::Retries 让单次 fetch 自身重试。
-              if sudo apt-get install -y --no-install-recommends \
-                   -o Acquire::Retries=8 --fix-missing $need; then
+              # 套 timeout 是为了防止 dpkg 锁或源挂起把整步拖死。
+              if timeout 300 sudo apt-get install -y --no-install-recommends \
+                   -o Acquire::Retries=6 -o Acquire::http::Timeout=15 \
+                   --fix-missing $need; then
                 break
               fi
               echo "::warning::apt 失败 (第 $i/$tries 次)"
-              i=$((i+1)); sleep 8
+              i=$((i+1)); sleep 5
             done
             dpkg -s libelf-dev >/dev/null 2>&1 || { echo "::error::libelf-dev 未装上"; exit 1; }
           else
@@ -108,6 +110,9 @@ jobs:
             command -v "$c" >/dev/null || echo "::warning::缺命令 $c"
           done
 
+      - name: 下载 Clang 工具链
+        run: |
+          set -euo pipefail
           mkdir -p kernel_workspace
           cd kernel_workspace
 
@@ -119,19 +124,26 @@ jobs:
 
           TCL="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379"
           fetch() {
-            local name="$1" out="$2" tries=8 i=1
-            local -a urls=("$TCL/$name" "https://ghproxy.net/$TCL/$name" "https://gh-proxy.com/$TCL/$name")
+            local name="$1" out="$2" tries=6 i=1
+            local -a urls=(
+              "$TCL/$name"
+              "https://ghproxy.net/$TCL/$name"
+              "https://gh-proxy.com/$TCL/$name"
+            )
             while [ "$i" -le "$tries" ]; do
               local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
               echo "  下载 $i/$tries: $u"
-              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
-                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
-                   --continue=true "$u" -o "$out"; then
+              # 每次尝试都套一层硬超时。aria2c 的 --timeout 只约束单条连接，
+              # 代理挂起时整体仍可能拖很久，曾有 run 卡在这一步二十多分钟。
+              if timeout 600 aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=2 \
+                   --timeout=20 --connect-timeout=10 --lowest-speed-limit=2k \
+                   --summary-interval=0 --continue=true "$u" -o "$out"; then
                 return 0
               fi
               echo "::warning::$name 失败 (第 $i/$tries 次)"
-              i=$((i+1)); sleep $((i * 3))
+              i=$((i+1)); sleep $((i * 2))
             done
+            echo "::error::$name 多次重试仍失败"
             return 1
           }
 
@@ -158,18 +170,19 @@ jobs:
           cd kernel_workspace
 
           fetch() {
-            local name="$1" url="$2" out="$3" tries=8 i=1
+            local name="$1" url="$2" out="$3" tries=6 i=1
             local -a urls=("$url" "https://ghproxy.net/$url" "https://gh-proxy.com/$url")
             while [ "$i" -le "$tries" ]; do
               local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
               echo "  下载 $i/$tries: $u"
-              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
-                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
-                   --continue=true "$u" -o "$out"; then
+              # 硬超时: 代理挂起时 aria2c 自身不会及时放弃
+              if timeout 900 aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=2 \
+                   --timeout=20 --connect-timeout=10 --lowest-speed-limit=2k \
+                   --summary-interval=0 --continue=true "$u" -o "$out"; then
                 return 0
               fi
               echo "::warning::$name 失败 (第 $i/$tries 次)"
-              i=$((i+1)); sleep $((i * 3))
+              i=$((i+1)); sleep $((i * 2))
             done
             return 1
           }
