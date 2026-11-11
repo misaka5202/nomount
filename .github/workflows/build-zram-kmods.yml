@@ -1,0 +1,537 @@
+name: build zram compressor kmods (OPPO MT6989)
+
+# 把 LZ4K / LZ4KD / LZ4K_OPLUS / ZSTDP 四个 zram 压缩算法各自编成独立 .ko，
+# 打包成 KernelSU 模块，开机 insmod 加载。zram 侧的算法切换交给 Scene。
+#
+# 为什么用 OPPO 官方源码树编而不是 DDK 通用头文件:
+#   .ko 的 __this_module 是按编译时的 struct module 布局生成的，内核加载时
+#   会拿它和自身布局比对 (check_modstruct_version)。布局不一致时
+#   6.1 内核返回 -ENOEXEC 且不打印任何日志，用户态只能看到
+#   "Exec format error"，完全无法从 dmesg 定位。
+#   实测: 设备上所有厂商 ko 的 .gnu.linkonce.this_module 段都是 1088 字节，
+#   必须用设备真实的 /proc/config.gz 才能编出同尺寸的结构体。
+#
+# 所以这里复用已验证的流程: 设备 config 原样 + 官方源码树, 让 CRC 自然算对,
+# 绝不做 CRC 伪造 (伪造会导致 mod_sysfs_setup 越界 panic)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '内核源码仓库'
+        required: false
+        type: string
+        default: 'oppo-source/android_kernel_oppo_mt6989'
+      kernel_branch:
+        description: '内核源码分支'
+        required: false
+        type: string
+        default: 'oppo/mt6989_b_16.0.0_find_x7'
+      modules_repo:
+        description: 'OPPO 内核模块仓库(提供 vendor/oplus)'
+        required: false
+        type: string
+        default: 'oppo-source/android_kernel_modules_oppo_mt6989'
+      modules_branch:
+        description: 'OPPO 内核模块分支'
+        required: false
+        type: string
+        default: 'oppo/mt6989_b_16.0.0_find_x7'
+      device_kernelrelease:
+        description: '设备 uname -r 完整输出, vermagic 必须与之一致'
+        required: true
+        type: string
+        default: '6.1.157-android14-11-o-ga8ed1c96e9fd'
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build zram kmods
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 缓存 Clang 工具链
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/clang20
+            kernel_workspace/build-tools
+          key: oppo-toolchain-clang20-r547379-v1
+
+      - name: 安装依赖 + 准备 Clang
+        run: |
+          set -euo pipefail
+          sudo apt-mark hold firefox libc-bin >/dev/null 2>&1 || true
+          sudo apt purge man-db >/dev/null 2>&1 || true
+          sudo rm -rf /var/lib/man-db/auto-update || true
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends \
+            binutils python-is-python3 libssl-dev libelf-dev zip xz-utils
+
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          if [ -x clang20/bin/clang ] && [ -d build-tools/bin ]; then
+            echo ">>> 工具链缓存命中"
+            ./clang20/bin/clang --version | head -n1
+            exit 0
+          fi
+
+          TCL="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379"
+          fetch() {
+            local name="$1" out="$2" tries=8 i=1
+            local -a urls=("$TCL/$name" "https://ghproxy.net/$TCL/$name" "https://gh-proxy.com/$TCL/$name")
+            while [ "$i" -le "$tries" ]; do
+              local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  下载 $i/$tries: $u"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$u" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::$name 失败 (第 $i/$tries 次)"
+              i=$((i+1)); sleep $((i * 3))
+            done
+            return 1
+          }
+
+          mkdir -p clang20
+          fetch clang-r547379.zip clang.zip
+          unzip -q -o clang.zip -d clang20
+          rm -f clang.zip
+          fetch build-tools.zip build-tools.zip
+          unzip -q -o build-tools.zip
+          rm -f build-tools.zip
+          ./clang20/bin/clang --version | head -n1
+
+      - name: 缓存内核源码与 vendor
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/vendor
+          key: zram-kernel-${{ inputs.kernel_branch }}-${{ inputs.modules_branch }}-v1
+
+      - name: 准备内核源码与 vendor
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          fetch() {
+            local name="$1" url="$2" out="$3" tries=8 i=1
+            local -a urls=("$url" "https://ghproxy.net/$url" "https://gh-proxy.com/$url")
+            while [ "$i" -le "$tries" ]; do
+              local u="${urls[$(( (i-1) % ${#urls[@]} ))]}"
+              echo "  下载 $i/$tries: $u"
+              if aria2c -s16 -x16 -k1M --max-tries=2 --retry-wait=3 \
+                   --timeout=30 --connect-timeout=15 --lowest-speed-limit=1k \
+                   --continue=true "$u" -o "$out"; then
+                return 0
+              fi
+              echo "::warning::$name 失败 (第 $i/$tries 次)"
+              i=$((i+1)); sleep $((i * 3))
+            done
+            return 1
+          }
+
+          if [ -d common/fs ] && [ -d vendor/oplus/kernel ]; then
+            echo ">>> 内核源码与 vendor 缓存命中"
+          else
+            rm -rf common vendor
+            echo ">>> 下载内核树"
+            fetch kernel \
+              "https://github.com/${{ inputs.kernel_repo }}/archive/refs/heads/${{ inputs.kernel_branch }}.zip" \
+              common.zip
+            unzip -q -o common.zip
+            mv "$(find . -maxdepth 1 -type d -name 'android_kernel_*' | head -n1)" common
+            rm -f common.zip
+
+            echo ">>> 下载 OPPO 模块仓库"
+            fetch modules \
+              "https://github.com/${{ inputs.modules_repo }}/archive/refs/heads/${{ inputs.modules_branch }}.zip" \
+              modules.zip
+            unzip -q -o modules.zip
+            mv "$(find . -maxdepth 1 -type d -name 'android_kernel_modules_*' | head -n1)" modules
+            rm -f modules.zip
+
+            # drivers/soc/oplus/* 指向 ../../../../vendor/oplus/kernel/...
+            cp -r modules/vendor vendor
+            rm -rf modules
+          fi
+          echo ">>> vendor: $(du -sh vendor 2>/dev/null | cut -f1)"
+
+      - name: 对齐设备内核版本
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          DEVICE_KREL="${{ inputs.device_kernelrelease }}"
+          KSUB="$(echo "$DEVICE_KREL" | cut -d'.' -f3 | cut -d'-' -f1)"
+          KSUFFIX="$(echo "$DEVICE_KREL" | cut -d'-' -f2-)"
+          echo ">>> 设备内核: $DEVICE_KREL (sublevel=$KSUB suffix=$KSUFFIX)"
+
+          # 开源树的 SUBLEVEL 可能与出货内核不同步(本次树内 134, 设备 157)
+          CUR_SUB="$(sed -n 's/^SUBLEVEL = //p' common/Makefile | tr -d ' ')"
+          if [ "$CUR_SUB" != "$KSUB" ]; then
+            sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $KSUB/" common/Makefile
+            echo ">>> SUBLEVEL: $CUR_SUB -> $KSUB"
+          fi
+
+          rm -f common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+            # 非干净 tag 状态下 setlocalversion 会追加 "+"，vermagic 带 "+"
+            # 会让 insmod 报 version magic mismatch 直接拒绝
+            sed -i 's|res="$res${scm:++}"|res="$res"|' "$f"
+            # 固定为设备内核的后缀；同时规避 zip 下载无 .git 时
+            # git rev-parse 上溯到 CI checkout 把无关 hash 泄进版本号
+            sed -i "\$s|echo \"\\\$res\"|echo \"-$KSUFFIX\"|" "$f"
+          done
+          echo ">>> vermagic 后缀: -$KSUFFIX"
+          tail -n 2 common/scripts/setlocalversion
+
+      - name: 克隆算法源码
+        run: |
+          set -euo pipefail
+          mkdir -p algos
+          cd algos
+          git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git sukisu
+          git clone --depth=1 https://github.com/xingguangcuican6666/ABK.git abk
+          echo ">>> SukiSU_patch: $(cd sukisu && git rev-parse --short HEAD)"
+          echo ">>> ABK:         $(cd abk && git rev-parse --short HEAD)"
+
+      - name: 生成四个算法模块目录
+        run: |
+          set -euo pipefail
+          # 摆位: 把 in-tree 形式的算法源码整理成独立 obj-m 模块
+          python3 zram_ko/stage_zram_modules.py \
+            "$(pwd)/algos/sukisu" "$(pwd)/algos/abk" "$(pwd)/zram_work"
+          echo "=== 已生成的模块目录 ==="
+          ls -1 zram_work
+
+      - name: 准备 zstdp 源码与 vendored zstd
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+
+          # ABK 的 setup_zstdp.sh 是为"集成进内核树"写的，会直接改
+          # crypto/、lib/、drivers/block/zram/，不适合 KO 方案。
+          # 用 scripts/vendor_zstdp.py 复刻它真正需要的部分:
+          # 抽内核树的 zstd 源码 + 头文件到模块目录，并对齐 include 路径。
+          #
+          # 符号前缀由 Makefile 里的 objcopy --redefine-syms 完成
+          # (zstdp_namespace.h 的 #define 只覆盖 wrapper 的调用点)。
+          python3 zram_ko/vendor_zstdp.py \
+            "$WORKDIR/kernel_workspace/common" \
+            "$WORKDIR/algos/abk/zram/zstdp" \
+            "$WORKDIR/zram_work/zstdp"
+
+          echo "=== zstdp 目录 ==="
+          ls -1 "$WORKDIR/zram_work/zstdp"
+          echo "--- vendor/lib/zstd ---"
+          ls "$WORKDIR/zram_work/zstdp/vendor/lib/zstd" | head -n 10
+
+      - name: 生成 .config 并 modules_prepare
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          # 先让树基于 gki_defconfig 生成自洽 .config，再把设备 /proc/config.gz
+          # 显式声明的每一项覆盖上去。两个都不能单独用:
+          #   - 直接用设备 config: 2400 个 vendor 专属符号树里没有 Kconfig 定义，
+          #     裁决时会连带关掉 CONFIG_MODULES/MODVERSIONS
+          #   - 只用 gki_defconfig: 缺 SYSFS/FTRACE/DEBUG_INFO_BTF_MODULES 等，
+          #     struct module 尺寸不对 -> module_layout 不匹配
+          make -j"$(nproc)" $FLAGS gki_defconfig
+          cp -f out/.config out/.config.tree
+
+          python3 "$GITHUB_WORKSPACE/scripts/overlay_config.py" \
+            out/.config.tree "$GITHUB_WORKSPACE/device_full.config" out/.config
+
+          sed -i -E 's|^CONFIG_MODULE_SIG_KEY=.*|# CONFIG_MODULE_SIG_KEY is not set|' out/.config
+          ./scripts/config --file out/.config -m NOMOUNT_DUMMY 2>/dev/null || true
+
+          echo "=== 关键配置核对(struct module 布局相关) ==="
+          MISS=0
+          for k in CONFIG_MODULES CONFIG_MODVERSIONS CONFIG_MODULE_UNLOAD \
+                   CONFIG_KALLSYMS_ALL CONFIG_SYSFS CONFIG_FTRACE CONFIG_ARM64 \
+                   CONFIG_DEBUG_INFO_BTF_MODULES CONFIG_ZRAM CONFIG_CRYPTO_ACOMP2; do
+            if grep -q "^${k}=" out/.config; then
+              echo "  OK    $(grep "^${k}=" out/.config | head -n1)"
+            else
+              echo "  MISS  $k"
+              case "$k" in
+                CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_ARM64) MISS=1 ;;
+              esac
+            fi
+          done
+          [ "$MISS" -eq 0 ] || { echo "::error::关键配置缺失"; exit 1; }
+
+          # resolve_btfids 在 Clang20 下有 const 限定符报错，打补丁修掉
+          python3 "$GITHUB_WORKSPACE/scripts/patch_resolve_btfids.py" .
+          make -j"$(nproc)" $FLAGS syncconfig
+          make -j"$(nproc)" $FLAGS modules_prepare
+
+          KREL="$(cat out/include/config/kernel.release)"
+          echo "KERNELRELEASE=$KREL" >> "$GITHUB_ENV"
+          echo ">>> 内核版本: $KREL"
+
+      - name: 生成符号表
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          # 外部模块构建时 modpost 只读 extmod 目录下的 Module.symvers，
+          # 不读 out/vmlinux.symvers。没有这张 CRC 表，ko 的 __versions 段
+          # 就是空的，设备上加载会失败。
+          if [ ! -s out/vmlinux.symvers ]; then
+            echo ">>> 编译 vmlinux 生成符号表 (约 20-30 分钟)..."
+            touch include/linux/module.h
+            make -j"$(nproc)" $FLAGS vmlinux || true
+          fi
+          [ -s out/vmlinux.symvers ] || { echo "::error::符号表缺失"; exit 1; }
+          echo ">>> 符号表: $(wc -l < out/vmlinux.symvers) 条"
+          echo ">>> module_layout: $(grep -P '\tmodule_layout\t' out/vmlinux.symvers | cut -f1)"
+
+      - name: 编译四个 ko
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          cp -f out/vmlinux.symvers Module.symvers
+          export KBUILD_EXTRA_SYMBOLS="$PWD/out/vmlinux.symvers"
+
+          OUT="$WORKDIR/kos"
+          mkdir -p "$OUT"
+
+          for m in lz4k lz4kd lz4k_oplus; do
+            echo "=============================================="
+            echo ">>> 编译 $m"
+            echo "=============================================="
+            MODDIR="$WORKDIR/zram_work/$m"
+            cp -f out/vmlinux.symvers "$MODDIR/Module.symvers" 2>/dev/null || true
+            if make -j"$(nproc)" $FLAGS M="$MODDIR" modules; then
+              find "$MODDIR" -name "${m}*.ko" -exec cp -v {} "$OUT/" \;
+            else
+              echo "::error::$m 编译失败"
+              exit 1
+            fi
+          done
+
+          echo "=== 产物 ==="
+          ls -lh "$OUT"
+
+      - name: 编译 zstdp
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          cd kernel_workspace/common
+
+          FLAGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang LD=ld.lld HOSTCC=clang HOSTLD=clang O=out
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error HOSTCFLAGS+=-Wno-error WERROR=0"
+
+          OUT="$WORKDIR/kos"
+          MODDIR="$WORKDIR/zram_work/zstdp"
+          mkdir -p "$OUT"
+
+          cp -f out/vmlinux.symvers "$MODDIR/Module.symvers"
+          export KBUILD_EXTRA_SYMBOLS="$PWD/out/vmlinux.symvers"
+
+          echo "=============================================="
+          echo ">>> 编译 zstdp"
+          echo "=============================================="
+          if make -j"$(nproc)" $FLAGS M="$MODDIR" modules; then
+            find "$MODDIR" -name 'zstdp*.ko' -exec cp -v {} "$OUT/" \;
+          else
+            echo "::error::zstdp 编译失败"
+            exit 1
+          fi
+
+          echo "=== 产物 ==="
+          ls -lh "$OUT"
+
+      - name: 汇总产物
+        run: |
+          set -euo pipefail
+          echo "=== 已编译的 ko ==="
+          ls -lh kos/ 2>/dev/null || echo "(无)"
+          for f in kos/*.ko; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") ---"
+            modinfo "$f" 2>/dev/null | grep -E 'vermagic|name:' || true
+          done
+
+      - name: 校验 ko
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          export PATH="$WORKDIR/kernel_workspace/clang20/bin:$PATH"
+
+          DEVICE_KREL="${{ inputs.device_kernelrelease }}"
+          EXPECT_VERMAGIC="$DEVICE_KREL SMP preempt mod_unload modversions aarch64"
+          DEV_ML=$(awk -F'\t' '$2=="module_layout"{print $1; exit}' device_symvers.txt)
+
+          [ -n "$DEV_ML" ] || { echo "::error::device_symvers.txt 缺 module_layout"; exit 1; }
+          echo "设备 module_layout: $DEV_ML"
+          echo "期望 vermagic: $EXPECT_VERMAGIC"
+          echo
+
+          FAIL=0
+          for f in kos/*.ko; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            echo "=== $name ==="
+
+            VM=$(modinfo -F vermagic "$f" 2>/dev/null || strings "$f" | grep -m1 'vermagic=' | sed 's/vermagic=//')
+            echo "  vermagic: $VM"
+            if [ "$VM" != "$EXPECT_VERMAGIC" ]; then
+              echo "  ::error::vermagic 不匹配"
+              FAIL=1
+            else
+              echo "  OK: vermagic 匹配"
+            fi
+
+            ML=$(python3 scripts/get_crc.py "$f" module_layout)
+            echo "  module_layout: $ML"
+            if [ "$ML" != "$DEV_ML" ]; then
+              echo "  ::error::module_layout 与设备不一致(会导致静默 ENOEXEC)"
+              FAIL=1
+            else
+              echo "  OK: module_layout 匹配"
+            fi
+
+            VERS=$(llvm-objdump -h "$f" 2>/dev/null | grep '__versions' | awk '{print $3}')
+            if [ -n "$VERS" ] && [ "$((16#$VERS))" -gt 0 ]; then
+              echo "  OK: __versions 段 $((16#$VERS)) 字节"
+            else
+              echo "  ::error::__versions 段缺失或为空"
+              FAIL=1
+            fi
+
+            # 确认算法确实注册了(检查 cra_name 字符串)
+            echo "  注册名: $(strings "$f" | grep -m1 -E '^(lz4k|lz4kd|lz4k_oplus|zstdp)$' || echo '?')"
+            echo
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::校验未通过"
+            exit 1
+          fi
+          echo "=== 全部 ko 校验通过 ==="
+
+      - name: 打包 KernelSU 模块
+        run: |
+          set -euo pipefail
+          WORKDIR="$(pwd)"
+          STAGE="$WORKDIR/ksu_module"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/system/lib/modules"
+
+          cp kos/*.ko "$STAGE/system/lib/modules/" 2>/dev/null || {
+            echo "::error::没有可打包的 ko"; exit 1; }
+
+          # 脚本模板放在 zram_ko/ksu_module/，避免 heredoc 与 YAML 缩进打架
+          cp zram_ko/ksu_module/post-fs-data.sh "$STAGE/post-fs-data.sh"
+          cp zram_ko/ksu_module/customize.sh   "$STAGE/customize.sh"
+          cp zram_ko/ksu_module/uninstall.sh   "$STAGE/uninstall.sh"
+          chmod 755 "$STAGE/post-fs-data.sh" "$STAGE/uninstall.sh"
+
+          KREL="${{ inputs.device_kernelrelease }}"
+          VER="$(date +%Y%m%d)"
+          {
+            printf 'id=zram_algos\n'
+            printf 'name=ZRAM Compressor Algorithms\n'
+            printf 'version=%s\n' "$VER"
+            printf 'versionCode=%s\n' "$VER"
+            printf 'author=ABK/SukiSU_patch port\n'
+            printf 'description=Extra zram compressors (lz4k, lz4kd, lz4k_oplus, zstdp) as loadable kernel modules. Built for %s. Switch compressor with Scene or sysfs.\n' "$KREL"
+          } > "$STAGE/module.prop"
+
+          cd "$STAGE"
+          ZIP="$WORKDIR/zram_algos-$(date +%Y%m%d).zip"
+          zip -qr9 "$ZIP" .
+          cd "$WORKDIR"
+
+          echo "=== 模块内容 ==="
+          unzip -l "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: zram-algos-kmods
+          path: |
+            kos/*.ko
+            zram_algos-*.zip
+
+      - name: 发布 Release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="zram-algos-$(date +%Y%m%d-%H%M%S)"
+          {
+            echo "### ZRAM 压缩算法 KO"
+            echo
+            echo "设备内核: \`${{ inputs.device_kernelrelease }}\`"
+            echo
+            echo "包含算法:"
+            echo "- \`lz4k\`"
+            echo "- \`lz4kd\` (含 delta 编码)"
+            echo "- \`lz4k_oplus\` (OPPO 优化版)"
+            echo "- \`zstdp\` (zstd 高压缩率变体)"
+            echo
+            echo "全部为独立 .ko，开机由模块 \`post-fs-data.sh\` insmod 加载。"
+            echo "zram 算法切换请用 Scene 或："
+            echo
+            echo '```sh'
+            echo 'echo lz4k_oplus > /sys/block/zram0/comp_algorithm'
+            echo '```'
+            echo
+            echo "加载日志: \`/data/local/tmp/zram_algos.log\`"
+            echo
+            echo "校验: 每个 ko 的 vermagic 与 module_layout 均已比对设备值。"
+          } > notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ZRAM algorithms for ${{ inputs.device_kernelrelease }}" \
+            --notes-file notes.md \
+            kos/*.ko "zram_algos-"*.zip
